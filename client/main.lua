@@ -574,7 +574,7 @@ local function flowScanNetwork()
     while true do
         framereset()
         local w, h = lg.getDimensions()
-        local font = setFont(h * 0.1)
+        setFont(h * 0.1)
         if backbutton() then
             scanner()
             return
@@ -594,16 +594,24 @@ local function flowScanNetwork()
         table.sort(list, function(a, b) return a.at > b.at end)
 
         local basey = 0.2 * h
-        local itemh = h * 0.1
+        local itemh = h * 0.15
         local stride = itemh + h * 0.02
         local statush = h * 0.05
         scroll = getScroll(scroll, basey + #list * stride + statush)
         local y = basey + scroll
         for i = 1, #list do
-            if button(list[i].name, w * 0.1, y, w * 0.8, itemh) then
+            local server = list[i]
+            setFont(h * 0.08)
+            if button(server.name, w * 0.1, y, w * 0.8, itemh, .5, 0) then
                 scanner()
-                local server = list[i]
                 return flowConnectToAddress(server.ip, server.port)
+            end
+            do
+                local subtexth = h * 0.03
+                local margin = h * 0.01
+                setFont(subtexth)
+                lg.printf(server.ip, w * 0.1 + margin, y + itemh - subtexth - margin,
+                    w * 0.8 - 2 * margin, 'right')
             end
             y = y + stride
         end
@@ -643,7 +651,7 @@ local function flowLoadAddress()
             love.keyboard.setTextInput(true)
         end
         local w, h = lg.getDimensions()
-        local font = setFont(h * 0.1)
+        setFont(h * 0.1)
         lg.printf('Enter IP:', 0, h * 0.1, w, 'center')
         lg.printf(ip, 0, h * 0.2, w, 'center')
         if backbutton() then
