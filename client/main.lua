@@ -59,7 +59,7 @@ local buttons = {}
 local fontcache = {}
 local presses = {}
 
-local function playgame(zipstring)
+local function playgame(zipstring, preload)
     print("playing " .. #zipstring .. " byte game")
     local zipdata = love.data.newByteData(zipstring)
     local success = love.filesystem.mount(zipdata, "gamezip", "", false)
@@ -68,8 +68,11 @@ local function playgame(zipstring)
     end
     love.keyboard.setTextInput(ogtextinput)
     love.run = ogloverun
-    if love.filesystem.getInfo('_anygamepreload.lua') then
-        require '_anygamepreload'
+    if preload then
+        print('loading ' .. #preload .. '-byte preload:')
+        print(preload)
+        local preloadfn = assert(load(preload, 'preload'))
+        preloadfn()
     end
     if love.filesystem.getInfo("conf.lua") then
         local t = {}
@@ -253,14 +256,15 @@ local function flowShowError(err)
     end
 end
 
-local function showList(list)
+local function showList(list, y)
     local w, h = lg.getDimensions()
-    setFont(h * 0.1)
-    local clicked = nil
+    local font = setFont(h * 0.1)
+    y = y or 0.15 * h
     for i = 1, #list do
-        if button(list[i], w * 0.1, 0.15 * h + h * 0.12 * (i - 1), w * 0.8, h * 0.1) then
+        if button(list[i], w * 0.1, y, w * 0.8, h * 0.1) then
             clicked = i
         end
+        y = y + font:getHeight() * 1.15
     end
     return clicked
 end
@@ -326,7 +330,7 @@ local function flowConnectToAddress(ip, port)
         return flowShowError('Error downloading game:\n' .. metadata)
     end
     storegame(metadata.name, zipstring)
-    playgame(zipstring)
+    playgame(zipstring, metadata.preload)
     return flowShowError('Failed to start game')
 end
 
@@ -346,10 +350,10 @@ local function fmtip(ip)
     return a .. '.' .. b .. '.' .. c .. '.' .. d
 end
 
-local function scanNetwork(available)
+local function scanNetwork(scan)
     local freq = 500
     local batchfreq = 5
-    local rebindperiod = 3
+    local rebindperiod = 5
     local broadperiod = 1.5
 
     local sock
@@ -358,6 +362,8 @@ local function scanNetwork(available)
     local nextrebind = love.timer.getTime()
     local scanidx = 0
     local baseip, bits
+    scan.available = {}
+    scan.active = false
     while true do
         local now = love.timer.getTime()
         if now >= nextrebind then
@@ -365,9 +371,16 @@ local function scanNetwork(available)
             -- re-create udp socket to get new local ip (useful if ie. network connects/disconnects)
             if sock then sock:close() end
             sock = socket.udp()
+            sock:setoption('reuseaddr', true)
+            sock:setoption('reuseport', true)
+            sock:setsockname('*', 0)
+            local ok, err = sock:setoption('broadcast', true)
+            if not ok then print("failed to set broadcast socket option: " .. tostring(err)) end
             sock:settimeout(0)
 
             local ipsock = socket.udp()
+            ipsock:setoption('reuseaddr', true)
+            ipsock:setoption('reuseport', true)
             ipsock:setpeername('1.1.1.1', 80)
             local myip = parseip(ipsock:getsockname())
             ipsock:close()
@@ -384,6 +397,7 @@ local function scanNetwork(available)
             else
                 print('cannot scan: ip ' .. myip .. ' does not match private subnet pattern')
             end
+            scan.active = baseip and bits
         end
         if now >= nextbatch then
             nextbatch = nextbatch + 1 / batchfreq
@@ -426,7 +440,7 @@ local function scanNetwork(available)
                 return meta
             end)
             if ok then
-                available[ip .. ':' .. port] = {
+                scan.available[ip .. ':' .. port] = {
                     ip = ip,
                     port = tonumber(meta.port),
                     name = meta.name,
@@ -450,7 +464,7 @@ local function flowScanNetwork()
     sock:setoption('reuseport', true)
     sock:settimeout(0)
     sock:setsockname('*', defaultport)
-    local available = {}
+    local scan = {}
     local scanner = coroutine.wrap(scanNetwork)
     while true do
         framereset()
@@ -461,10 +475,15 @@ local function flowScanNetwork()
             return
         end
 
-        scanner(available)
+        scanner(scan)
+        for key, server in pairs(scan.available) do
+            if love.timer.getTime() - server.at > 8 then
+                scan.available[key] = nil
+            end
+        end
 
         local list = {}
-        for key, server in pairs(available) do
+        for key, server in pairs(scan.available) do
             list[#list + 1] = server
         end
         table.sort(list, function(a, b) return a.at > b.at end)
@@ -472,7 +491,13 @@ local function flowScanNetwork()
         for i, server in ipairs(list) do
             strlist[i] = server.name
         end
-        local chosen = showList(strlist)
+        local status = 'No network detected'
+        if scan.active then
+            local t = math.floor(love.timer.getTime() / 0.5) % 3
+            status = 'Scanning local network' .. ('.'):rep(1 + t)
+        end
+        lg.printf(status, 0, h * 0.15, w, 'center')
+        local chosen = showList(strlist, h * 0.3)
         if chosen then
             local server = list[chosen]
             scanner()
