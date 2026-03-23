@@ -83,6 +83,8 @@ end
 
 local buttons = {}
 local fontcache = {}
+local events = {}
+local pointers = {}
 local presses = {}
 
 local function playgame(zipstring, preload)
@@ -287,15 +289,23 @@ local function metadata(data)
 end
 
 local function framereset(handler)
-    local events = coroutine.yield()
+    events = coroutine.yield()
     lg.origin()
     lg.clear(0.1, 0.2, 0.3)
     presses = {}
     for _, ev in ipairs(events) do
         local name, a, b, c, d, e, f = ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]
-        if name == 'mousereleased' then
+        if name == 'mousepressed' then
             local x, y, but, istouch = a, b, c, d
             if not istouch then
+                pointers[but] = love.timer.getTime()
+            end
+        elseif name == 'touchpressed' then
+            local id, x, y, dx, dy, pressure = a, b, c, d, e, f
+            pointers[id] = love.timer.getTime()
+        elseif name == 'mousereleased' then
+            local x, y, but, istouch = a, b, c, d
+            if not istouch and pointers[but] and love.timer.getTime() - pointers[but] < 0.300 then
                 presses[#presses + 1] = {
                     x = x,
                     y = y,
@@ -303,10 +313,12 @@ local function framereset(handler)
             end
         elseif name == 'touchreleased' then
             local id, x, y, dx, dy, pressure = a, b, c, d, e, f
-            presses[#presses + 1] = {
-                x = x,
-                y = y,
-            }
+            if pointers[id] and love.timer.getTime() - pointers[id] < 0.300 then
+                presses[#presses + 1] = {
+                    x = x,
+                    y = y,
+                }
+            end
         end
         if handler then
             handler(name, a, b, c, d, e, f)
@@ -344,6 +356,21 @@ local function backbutton()
     return button("Back", w * 0.02, h * 0.02, font:getWidth("Back"), font:getHeight())
 end
 
+local function getScroll(current, height)
+    local w, h = lg.getDimensions()
+    for _, ev in ipairs(events) do
+        local name, a, b, c, d, e, f = ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]
+        if name == 'touchmoved' then
+            local id, x, y, dx, dy, pressure = a, b, c, d, e, f
+            current = current + dy
+        elseif name == 'wheelmoved' then
+            local dx, dy = a, b
+            current = current + dy * h * 0.03
+        end
+    end
+    return math.min(0, math.max(current, -height + h * 0.9))
+end
+
 local function flowShowError(err)
     while true do
         framereset()
@@ -354,19 +381,6 @@ local function flowShowError(err)
             return
         end
     end
-end
-
-local function showList(list, y)
-    local w, h = lg.getDimensions()
-    local font = setFont(h * 0.1)
-    y = y or 0.15 * h
-    for i = 1, #list do
-        if button(list[i], w * 0.1, y, w * 0.8, h * 0.1) then
-            clicked = i
-        end
-        y = y + font:getHeight() * 1.15
-    end
-    return clicked
 end
 
 local function flowConnectToAddress(ip, port)
@@ -556,6 +570,7 @@ end
 local function flowScanNetwork()
     local scan = {}
     local scanner = coroutine.wrap(scanNetwork)
+    local scroll = 0
     while true do
         framereset()
         local w, h = lg.getDimensions()
@@ -577,22 +592,29 @@ local function flowScanNetwork()
             list[#list + 1] = server
         end
         table.sort(list, function(a, b) return a.at > b.at end)
-        local strlist = {}
-        for i, server in ipairs(list) do
-            strlist[i] = server.name
+
+        local basey = 0.2 * h
+        local itemh = h * 0.1
+        local stride = itemh + h * 0.02
+        local statush = h * 0.05
+        scroll = getScroll(scroll, basey + #list * stride + statush)
+        local y = basey + scroll
+        for i = 1, #list do
+            if button(list[i].name, w * 0.1, y, w * 0.8, itemh) then
+                scanner()
+                local server = list[i]
+                return flowConnectToAddress(server.ip, server.port)
+            end
+            y = y + stride
         end
+
+        setFont(statush)
         local status = 'No network detected'
         if scan.active then
             local t = math.floor(love.timer.getTime() / 0.5) % 3
             status = 'Scanning local network' .. ('.'):rep(1 + t)
         end
-        lg.printf(status, 0, h * 0.15, w, 'center')
-        local chosen = showList(strlist, h * 0.3)
-        if chosen then
-            local server = list[chosen]
-            scanner()
-            return flowConnectToAddress(server.ip, server.port)
-        end
+        lg.printf(status, 0, y, w, 'center')
     end
 end
 
@@ -780,6 +802,8 @@ local function flowSavedGames()
     local sharing = nil
     local sharer = nil
 
+    local scroll = 0
+
     while true do
         framereset()
         local w, h = lg.getDimensions()
@@ -792,8 +816,11 @@ local function flowSavedGames()
         if sharer then sharer(sharing) end
 
         sortGameList(games, favorites)
-        local y = h * 0.17
+        local basey = h * 0.17
         local buth = h * 0.15
+        local butstride = buth + 0.02 * h
+        scroll = getScroll(scroll, butstride * #games + basey)
+        local y = scroll + basey
         for _, game in ipairs(games) do
             setFont(h * 0.08)
             lg.setColor(1, 1, 1, favorites[game.id] and 1 or 0.1)
@@ -855,7 +882,7 @@ local function flowSavedGames()
                     sharer = coroutine.wrap(shareGame)
                 end
             end
-            y = y + buth + 0.02 * h
+            y = y + butstride
         end
     end
 end
