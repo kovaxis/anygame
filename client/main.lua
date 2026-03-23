@@ -10,6 +10,19 @@ local ogloverun = love.run
 local ogtextinput = love.keyboard.hasTextInput()
 local framefunc
 
+local function mesh(verts)
+    local tris = love.math.triangulate(verts)
+    local verts = {}
+    for _, tri in ipairs(tris) do
+        for i = 0, 2 do
+            verts[#verts + 1] = { tri[i * 2 + 1], tri[i * 2 + 2] }
+        end
+    end
+    return love.graphics.newMesh(verts, 'triangles', 'static')
+end
+local starmesh = mesh { 0.000, -1.000, 0.294, -0.405, 0.951, -0.309, 0.476, 0.155, 0.588, 0.809, 0.000, 0.500, -0.588, 0.809, -0.476, 0.155, -0.951, -0.309, -0.294, -0.405 }
+
+
 local function serialize(keyval)
     local n = 0
     for k, v in pairs(keyval) do
@@ -231,7 +244,7 @@ local function button(text, x, y, w, h)
     lg.printf(text, x, y + h / 2 - f:getHeight() / 2, w, 'center')
     lg.rectangle('line', x, y, w, h)
     for _, press in ipairs(presses) do
-        if press.x >= x - w and press.x < x + w and press.y >= y - h and press.y < y + h then
+        if press.x >= x and press.x < x + w and press.y >= y and press.y < y + h then
             return true
         end
     end
@@ -554,6 +567,7 @@ local function flowSavedGames()
                     path = path,
                     hash = hash,
                     name = name,
+                    id = name .. '.' .. hash,
                     modtime = info.modtime or 0,
                 }
             end
@@ -564,19 +578,44 @@ local function flowSavedGames()
         if a.name ~= b.name then return a.name < b.name end
         return a.hash < b.hash
     end)
-    local labels = {}
-    for i = 1, #games do
-        labels[i] = games[i].name
-    end
+
+    local favorites = {}
+    local sharing = nil
 
     while true do
         framereset()
+        local w, h = lg.getDimensions()
+        setFont(h * 0.1)
         if backbutton() then return end
-        local i = showList(labels)
-        if i then
-            local game = games[i]
-            local zipstring = love.filesystem.read(game.path)
-            if zipstring then playgame(zipstring) end
+        local y = h * 0.17
+        local buth = h * 0.13
+        for _, game in ipairs(games) do
+            setFont(h * 0.08)
+            lg.setColor(1, 1, 1, favorites[game.id] and 1 or 0.1)
+            lg.draw(starmesh, w * 0.1 + buth / 2, y + buth / 2, 0, .9 * buth / 2)
+            lg.setColor(1, 1, 1)
+            if button("", w * 0.1, y, buth, buth) then
+                if favorites[game.id] then
+                    favorites[game.id] = nil
+                else
+                    favorites[game.id] = os.time()
+                end
+            end
+            if button(game.name, w * 0.1 + buth, y, w * 0.8 - 2 * buth, buth) then
+                local zipstring = love.filesystem.read(game.path)
+                if zipstring then
+                    return playgame(zipstring)
+                end
+            end
+            setFont(h * 0.035)
+            if button(sharing ~= game.id and "SHARE" or "STOP", w * 0.9 - buth, y, buth, buth) then
+                if sharing == game.id then
+                    sharing = nil
+                else
+                    sharing = game.id
+                end
+            end
+            y = y + buth + 0.02 * h
         end
     end
 end
