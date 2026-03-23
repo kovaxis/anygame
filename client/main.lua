@@ -4,6 +4,7 @@ local lg = love.graphics
 local defaultport = 35355
 local magicstr = ' \0\r\n  \x02\n \x08\rAnYgAmE \n\n'
 local version = "0.2.0"
+local maxsavedgamecache = 3
 local paths = { ip = 'ip.txt', saved = 'savedgames', fav = "favorites.txt" }
 local namepattern = '^[a-zA-Z0-9_%-]+$'
 local ogloverun = love.run
@@ -89,6 +90,7 @@ local function playgame(zipstring, preload)
     local zipdata = love.data.newByteData(zipstring)
     local success = love.filesystem.mount(zipdata, "gamezip", "", false)
     if not success then
+        print('failed to mount game zip')
         return false
     end
     love.keyboard.setTextInput(ogtextinput)
@@ -192,12 +194,84 @@ local function playgame(zipstring, preload)
     framefunc = love.run()
 end
 
+local function loadGameList()
+    local rawFiles = love.filesystem.getDirectoryItems(paths.saved)
+    local games = {}
+    for _, filename in ipairs(rawFiles) do
+        local path = paths.saved .. '/' .. filename
+        local info = love.filesystem.getInfo(path)
+        if info then
+            local name, hash = filename:match('^([^.]+)%.([a-zA-Z0-9_%-]+)%.love$')
+            if name and hash then
+                games[#games + 1] = {
+                    path = path,
+                    hash = hash,
+                    name = name,
+                    id = name .. '.' .. hash,
+                    modtime = info.modtime,
+                }
+            end
+        end
+    end
+
+    local favorites = {}
+    local s = love.filesystem.read(paths.fav)
+    if s then
+        for sfav in s:gmatch('[^\n]+') do
+            local id, at = sfav:match('^([^:]+):([0-9]+)$')
+            at = tonumber(at)
+            if id and at then
+                for _, game in ipairs(games) do
+                    if game.id == id then
+                        favorites[id] = at
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    return games, favorites
+end
+
+local function sortGameList(games, favorites)
+    table.sort(games, function(a, b)
+        if favorites[a.id] ~= favorites[b.id] then
+            return (favorites[a.id] or 0) > (favorites[b.id] or 0)
+        end
+        if a.modtime ~= b.modtime then return (a.modtime or 0) > (b.modtime or 0) end
+        if a.name ~= b.name then return a.name < b.name end
+        return a.hash < b.hash
+    end)
+end
+
 local function storegame(name, zipstring)
     local hash = love.data.hash('sha256', zipstring)
     hash = hash:sub(1, 12)
     hash = love.data.encode('string', 'base64', hash):gsub('%+', '-'):gsub('%/', '_')
     local path = paths.saved .. '/' .. name .. '.' .. hash .. '.love'
-    love.filesystem.createDirectory(paths.saved)
+
+    -- make space for new game
+    local games, favorites = loadGameList()
+    sortGameList(games, favorites)
+    local isrepeat = false
+    for i = #games, 1, -1 do
+        if favorites[games[i].id] then
+            table.remove(games, i)
+        end
+        if games[i].path == path then
+            isrepeat = true
+        end
+    end
+    if not isrepeat then
+        while #games >= maxsavedgamecache do
+            local ok = check(love.filesystem.remove(games[#games].path))
+            if not ok then break end
+        end
+    end
+
+    -- actually store game
+    check(love.filesystem.createDirectory(paths.saved))
     local ok, err = love.filesystem.write(path, zipstring)
     if ok then
         print('saved ' .. #zipstring .. ' byte game "' .. name .. '" to "' .. path .. '"')
@@ -538,7 +612,7 @@ local function flowLoadAddress()
                     end
                 elseif key == 'return' then
                     love.keyboard.setTextInput(false)
-                    love.filesystem.write(paths.ip, ip)
+                    check(love.filesystem.write(paths.ip, ip))
                     return flowConnectToAddress(ip)
                 end
             end
@@ -551,7 +625,7 @@ local function flowLoadAddress()
         lg.printf('Enter IP:', 0, h * 0.1, w, 'center')
         lg.printf(ip, 0, h * 0.2, w, 'center')
         if backbutton() then
-            love.filesystem.write(paths.ip, ip)
+            check(love.filesystem.write(paths.ip, ip))
             return
         end
     end
@@ -584,7 +658,7 @@ local function fmttime(time)
 end
 
 local function shareGame(game)
-    local data = love.filesystem.read(game.path)
+    local data = assert(love.filesystem.read(game.path))
     print('sharing ' .. #data .. '-byte game ' .. game.path)
     local headpacket = metadata { name = game.name }
     local tcp = socket.tcp()
@@ -696,24 +770,8 @@ local function shareGame(game)
 end
 
 local function flowSavedGames()
-    local rawFiles = love.filesystem.getDirectoryItems(paths.saved)
-    local games = {}
-    for _, filename in ipairs(rawFiles) do
-        local path = paths.saved .. '/' .. filename
-        local info = love.filesystem.getInfo(path)
-        if info then
-            local name, hash = filename:match('^([^.]+)%.([a-zA-Z0-9_%-]+)%.love$')
-            if name and hash then
-                games[#games + 1] = {
-                    path = path,
-                    hash = hash,
-                    name = name,
-                    id = name .. '.' .. hash,
-                    modtime = info.modtime,
-                }
-            end
-        end
-    end
+    local games, favorites = loadGameList()
+
     local countByName = {}
     for _, game in ipairs(games) do
         countByName[game.name] = (countByName[game.name] or 0) + 1
@@ -721,24 +779,6 @@ local function flowSavedGames()
 
     local sharing = nil
     local sharer = nil
-    local favorites = {}
-    do
-        local s = love.filesystem.read(paths.fav)
-        if s then
-            for sfav in s:gmatch('[^\n]+') do
-                local id, at = sfav:match('^([^:]+):([0-9]+)$')
-                at = tonumber(at)
-                if id and at then
-                    for _, game in ipairs(games) do
-                        if game.id == id then
-                            favorites[id] = at
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
 
     while true do
         framereset()
@@ -751,14 +791,7 @@ local function flowSavedGames()
 
         if sharer then sharer(sharing) end
 
-        table.sort(games, function(a, b)
-            if favorites[a.id] ~= favorites[b.id] then
-                return (favorites[a.id] or 0) > (favorites[b.id] or 0)
-            end
-            if a.modtime ~= b.modtime then return (a.modtime or 0) > (b.modtime or 0) end
-            if a.name ~= b.name then return a.name < b.name end
-            return a.hash < b.hash
-        end)
+        sortGameList(games, favorites)
         local y = h * 0.17
         local buth = h * 0.15
         for _, game in ipairs(games) do
@@ -776,22 +809,21 @@ local function flowSavedGames()
                 for id, at in pairs(favorites) do
                     s[#s + 1] = id .. ':' .. at
                 end
-                love.filesystem.write(paths.fav, table.concat(s, '\n'))
+                check(love.filesystem.write(paths.fav, table.concat(s, '\n')))
             end
             if button(game.name, w * 0.1 + buth, y, w * 0.8 - 2 * buth, buth, 0.5, 0) then
-                local zipstring = love.filesystem.read(game.path)
-                if zipstring and #zipstring > 0 then
-                    local file = love.filesystem.newFile(game.path, 'a')
-                    if file then
-                        -- noop write (love doesnt expose a touch function)
-                        file:setBuffer('none')
-                        file:seek(0)
-                        file:write(zipstring:sub(1, 1))
-                        file:close()
-                    end
-                    if sharer then sharer() end
-                    return playgame(zipstring)
+                local zipstring = assert(love.filesystem.read(game.path))
+                local file = check(love.filesystem.newFile(game.path, 'a'))
+                if file then
+                    -- noop write (love doesnt expose a touch function)
+                    file:setBuffer('none')
+                    file:seek(0)
+                    file:write(zipstring:sub(1, 1))
+                    file:close()
                 end
+                if sharer then sharer() end
+                playgame(zipstring)
+                return flowShowError('Failed to start game')
             end
             do
                 local subtexth = h * 0.03
