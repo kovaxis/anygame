@@ -555,6 +555,32 @@ local function flowLoadAddress()
     end
 end
 
+local function fmttime(time)
+    local function fmt(dt)
+        local function ss(n)
+            return n == 1 and '' or 's'
+        end
+        if dt < 60 then return dt .. ' second' .. ss(dt) end
+        dt = math.floor(dt / 60)
+        if dt < 60 then return dt .. ' minute' .. ss(dt) end
+        dt = math.floor(dt / 60)
+        if dt < 24 then return dt .. ' hour' .. ss(dt) end
+        dt = math.floor(dt / 24)
+        if dt < 7 then return dt .. ' day' .. ss(dt) end
+        if dt < 30 then return math.floor(dt / 7) .. ' week' .. ss(math.floor(dt / 7)) end
+        if dt <= 365 then return math.floor(dt / 30) .. ' month' .. ss(math.floor(dt / 7)) end
+        return math.floor(dt / 365.25) .. ' year' .. ss(math.floor(dt / 7))
+    end
+
+    local diff = os.time() - time
+    if diff == 0 then return 'Now' end
+    if diff > 0 then
+        return fmt(diff) .. ' ago'
+    else
+        return 'In ' .. fmt(-diff)
+    end
+end
+
 local function flowSavedGames()
     local rawFiles = love.filesystem.getDirectoryItems(paths.saved)
     local games = {}
@@ -569,7 +595,7 @@ local function flowSavedGames()
                     hash = hash,
                     name = name,
                     id = name .. '.' .. hash,
-                    modtime = info.modtime or 0,
+                    modtime = info.modtime,
                 }
             end
         end
@@ -609,7 +635,7 @@ local function flowSavedGames()
             if favorites[a.id] ~= favorites[b.id] then
                 return (favorites[a.id] or 0) > (favorites[b.id] or 0)
             end
-            if a.modtime ~= b.modtime then return a.modtime > b.modtime end
+            if a.modtime ~= b.modtime then return (a.modtime or 0) > (b.modtime or 0) end
             if a.name ~= b.name then return a.name < b.name end
             return a.hash < b.hash
         end)
@@ -634,16 +660,31 @@ local function flowSavedGames()
             end
             if button(game.name, w * 0.1 + buth, y, w * 0.8 - 2 * buth, buth, 0.5, 0) then
                 local zipstring = love.filesystem.read(game.path)
-                if zipstring then
+                if zipstring and #zipstring > 0 then
+                    local file = love.filesystem.newFile(game.path, 'a')
+                    if file then
+                        -- noop write (love doesnt expose a touch function)
+                        file:setBuffer('none')
+                        file:seek(0)
+                        file:write(zipstring:sub(1, 1))
+                        file:close()
+                    end
                     return playgame(zipstring)
                 end
             end
-            if countByName[game.name] > 1 then
+            do
                 local subtexth = h * 0.03
                 local margin = h * 0.01
                 setFont(subtexth)
-                lg.printf(game.hash, w * 0.1 + buth + margin, y + buth - subtexth - margin, w * 0.8 - 2 * buth - 2 *
-                    margin, 'left')
+                if countByName[game.name] > 1 then
+                    lg.printf(game.hash, w * 0.1 + buth + margin, y + buth - subtexth - margin, w * 0.8 - 2 * buth - 2 *
+                        margin, 'left')
+                end
+                if game.modtime then
+                    lg.printf(fmttime(game.modtime), w * 0.1 + buth + margin, y + buth - subtexth - margin,
+                        w * 0.8 - 2 * buth - 2 *
+                        margin, 'right')
+                end
             end
             setFont(h * 0.035)
             if button(sharing ~= game.id and "SHARE" or "STOP", w * 0.9 - buth, y, buth, buth) then
