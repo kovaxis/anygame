@@ -5,7 +5,7 @@ local defaultport = 35355
 local magicstr = ' \0\r\n  \x02\n \x08\rAnYgAmE \n\n'
 local version = "0.2.0"
 local maxsavedgamecache = 3
-local paths = { ip = 'ip.txt', saved = 'savedgames', fav = "favorites.txt" }
+local paths = { ip = 'ip.txt', saved = 'savedgames', fav = "favorites.txt", last = "last.txt" }
 local namepattern = '^[a-zA-Z0-9_%-]+$'
 local ogloverun = love.run
 local ogtextinput = love.keyboard.hasTextInput()
@@ -196,6 +196,20 @@ local function playgame(zipstring, preload)
     framefunc = love.run()
 end
 
+local function playstoredgame(path)
+    local zipstring = assert(love.filesystem.read(path))
+    local file = check(love.filesystem.newFile(path, 'a'))
+    if file then
+        -- noop write (love doesnt expose a touch function)
+        file:setBuffer('none')
+        file:seek(0)
+        file:write(zipstring:sub(1, 1))
+        file:close()
+    end
+    check(love.filesystem.write(paths.last, path))
+    playgame(zipstring)
+end
+
 local function loadGameList()
     local rawFiles = love.filesystem.getDirectoryItems(paths.saved)
     local games = {}
@@ -251,7 +265,8 @@ local function storegame(name, zipstring)
     local hash = love.data.hash('sha256', zipstring)
     hash = hash:sub(1, 12)
     hash = love.data.encode('string', 'base64', hash):gsub('%+', '-'):gsub('%/', '_')
-    local path = paths.saved .. '/' .. name .. '.' .. hash .. '.love'
+    local id = name .. '.' .. hash
+    local path = paths.saved .. '/' .. id .. '.love'
 
     -- make space for new game
     local games, favorites = loadGameList()
@@ -261,7 +276,7 @@ local function storegame(name, zipstring)
         if favorites[games[i].id] then
             table.remove(games, i)
         end
-        if games[i].path == path then
+        if games[i].id == id then
             isrepeat = true
         end
     end
@@ -280,6 +295,8 @@ local function storegame(name, zipstring)
     else
         print('error saving ' .. #zipstring .. ' byte game "' .. name .. '" to "' .. path .. '": ' .. tostring(err))
     end
+
+    return path
 end
 
 local function metadata(data)
@@ -394,11 +411,12 @@ local function flowConnectToAddress(ip, port)
         end
     end
     ip = ip:match("^%s*(.-)%s*$")
+    port = port or defaultport
 
     if draw('Connecting...', 2) then return end
     local sock = socket.tcp()
     check(sock:settimeout(5))
-    local ok, err = sock:connect(ip, port or defaultport)
+    local ok, err = sock:connect(ip, port)
     if not ok then
         sock:close()
         return flowShowError('Connection error:\n' .. err)
@@ -443,7 +461,8 @@ local function flowConnectToAddress(ip, port)
     if not ok then
         return flowShowError('Error downloading game:\n' .. metadata)
     end
-    storegame(metadata.name, zipstring)
+    local path = storegame(metadata.name, zipstring)
+    check(love.filesystem.write(paths.last, path .. ';' .. ip .. ';' .. port))
     playgame(zipstring, metadata.preload)
     return flowShowError('Failed to start game')
 end
@@ -847,17 +866,8 @@ local function flowSavedGames()
                 check(love.filesystem.write(paths.fav, table.concat(s, '\n')))
             end
             if button(game.name, w * 0.1 + buth, y, w * 0.8 - 2 * buth, buth, 0.5, 0) then
-                local zipstring = assert(love.filesystem.read(game.path))
-                local file = check(love.filesystem.newFile(game.path, 'a'))
-                if file then
-                    -- noop write (love doesnt expose a touch function)
-                    file:setBuffer('none')
-                    file:seek(0)
-                    file:write(zipstring:sub(1, 1))
-                    file:close()
-                end
                 if sharer then sharer() end
-                playgame(zipstring)
+                playstoredgame(game.path)
                 return flowShowError('Failed to start game')
             end
             do
@@ -895,20 +905,74 @@ local function flowSavedGames()
     end
 end
 
+local function loadLast()
+    local laststr = check(love.filesystem.read(paths.last))
+    if not laststr then return {} end
+    local parts = {}
+    for part in laststr:gmatch('[^;]+') do parts[#parts + 1] = part end
+    local path, ip, port = parts[1], parts[2], parts[3]
+    local ret = {
+        path = path,
+        ip = ip,
+        port = port,
+    }
+    if ip and port then
+        local sock = socket.tcp()
+        check(sock:settimeout(0.5))
+        local ok = sock:connect(ip, port)
+        sock:close()
+        if ok then
+            ret.type = 'net'
+            return ret
+        end
+    end
+    if path then
+        if love.filesystem.getInfo(path) then
+            ret.type = 'path'
+            return ret
+        end
+    end
+    return ret
+end
+
 local function flowMain()
+    local last = loadLast()
+
     while true do
         framereset()
         local w, h = lg.getDimensions()
+        setFont(h * 0.2)
+        lg.printf("Anygame", 0, h * 0.1, w, 'center')
         setFont(h * 0.1)
-        if button('Load from network', 0, h * 0.3, w, h * 0.1) then
+        local itemh = h * 0.1
+        local stride = itemh + h * 0.02
+        local y = h * 0.52
+        if last.type then
+            local text = 'Continue'
+            if last.type == 'path' and last.ip then
+                text = text .. ' offline'
+            end
+            if button(text, w * 0.1, y - stride, w * 0.8, itemh) then
+                if last.type == 'net' then
+                    flowConnectToAddress(last.ip, last.port)
+                elseif last.type == 'path' then
+                    playstoredgame(last.path)
+                    flowShowError('Failed to start game')
+                end
+            end
+        end
+        if button('Load from network', w * 0.1, y, w * 0.8, itemh) then
             flowScanNetwork()
         end
-        if button('Load from IP', 0, h * 0.4, w, h * 0.1) then
+        y = y + stride
+        if button('Load from IP', w * 0.1, y, w * 0.8, itemh) then
             flowLoadAddress()
         end
-        if button('Saved games', 0, h * 0.5, w, h * 0.1) then
+        y = y + stride
+        if button('Saved games', w * 0.1, y, w * 0.8, itemh) then
             flowSavedGames()
         end
+        y = y + stride
     end
 end
 
