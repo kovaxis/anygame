@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import subprocess
 import socket
 from threading import Thread
+import time
 import traceback
 import os
 import sys
@@ -13,7 +15,7 @@ import struct
 
 defaultport = 35355
 magic = " \0\r\n  \x02\n \x08\rAnYgAmE \n\n"
-version = "0.2"
+version = "0.2.0"
 
 if len(sys.argv) < 2:
     print("expecting a game directory as command-line argument")
@@ -23,6 +25,7 @@ gamedir = sys.argv[1]
 if not Path(gamedir).exists():
     print("path '" + gamedir + "' does not exist")
     sys.exit(1)
+gamename, _ = re.subn(r"[^a-zA-Z0-9_-]", "", Path(gamedir).name)
 
 
 def packgame():
@@ -95,8 +98,106 @@ def metadata(data):
     return serialize({"magic": magic, "version": version, **data})
 
 
+@dataclass
+class BroadcastAddr:
+    ip: str
+    asint: int
+    bits: int
+
+    def get(self, idx):
+        idx &= (1 << self.bits) - 1
+        if idx == 0 or idx == ((1 << self.bits) - 1):
+            return None
+        asint = self.asint & ~((1 << self.bits) - 1) | idx
+        return f"{asint >> 24 & 0xFF}.{asint >> 16 & 0xFF}.{asint >> 8 & 0xFF}.{asint & 0xFF}"
+
+
+def getbroadcastaddrs():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.connect(("1.1.1.1", 80))
+        ownaddress, _ownport = sock.getsockname()
+    parts = ownaddress.split(".")
+    if not all(re.match(r"^[0-9]+$", part) for part in parts) or len(parts) != 4:
+        return []
+    parts = list(map(int, parts))
+    if not all(0 <= part <= 255 for part in parts):
+        return []
+    out = []
+
+    def add(ogbits):
+        addr = list(parts)
+        i = 3
+        bits = ogbits
+        while bits >= 8:
+            addr[i] = 255
+            i = i - 1
+            bits = bits - 8
+        if bits > 0:
+            addr[i] = addr[i] | ((1 << bits) - 1)
+        out.append(
+            BroadcastAddr(
+                ip=".".join(map(str, addr)),
+                asint=parts[0] << 24 | parts[1] << 16 | parts[2] << 8 | parts[3],
+                bits=ogbits,
+            )
+        )
+
+    if parts[0] == 192 and parts[1] == 168:
+        add(8)
+        add(12)
+        add(16)
+    elif parts[0] == 172 and parts[1] & 0xF == 16:
+        add(8)
+        add(12)
+    elif parts[0] == 10:
+        add(8)
+        add(12)
+        add(16)
+        add(20)
+        add(24)
+    return out
+
+
+def announce():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.bind(("0.0.0.0", defaultport))
+        targets = getbroadcastaddrs()
+        lastbroad = -9999
+
+        def send(to):
+            sock.sendto(
+                metadata({"name": gamename, "port": str(defaultport)}),
+                (to, defaultport),
+            )
+
+        idx = 0
+        freq = 100
+        batchfreq = 4
+        while True:
+            try:
+                now = time.monotonic()
+                sentto = set()
+                if now - lastbroad > 999999:
+                    for target in targets:
+                        send(target.ip)
+                    lastbroad = now
+                for _ in range(int(freq / batchfreq)):
+                    for target in targets:
+                        ip = target.get(idx)
+                        if ip and ip not in sentto:
+                            sentto.add(ip)
+                            send(ip)
+                    idx += 1
+                time.sleep(1 / batchfreq)
+            except OSError:
+                traceback.print_exc()
+                time.sleep(5)
+
+
 def serve(peer, addr):
-    gamename, _ = re.subn(r"[^a-zA-Z0-9_-]", "", Path(gamedir).name)
     try:
         print("serving connection from", addr)
         req = bytearray()
@@ -110,13 +211,9 @@ def serve(peer, addr):
         req = unserialize(req)
         check(req["magic"] == magic, "invalid magic sequence")
         check(req["version"], "invalid version")
-        if req["what"] == "list":
-            peer.sendall(metadata({"names": gamename}))
+        if req["what"] == "head":
+            peer.sendall(metadata({"name": gamename}))
         elif req["what"] == "get":
-            check(
-                req["name"] == gamename,
-                f"expected game name to match {gamename}, got {req['name']}",
-            )
             print("serving game to", addr)
             peer.sendall(metadata({"name": gamename}))
             peer.sendall(packgame())
@@ -128,6 +225,8 @@ def serve(peer, addr):
         peer.close()
         serving.discard(str(addr))
 
+
+Thread(target=announce).start()
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

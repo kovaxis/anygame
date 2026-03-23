@@ -3,8 +3,9 @@ local utf8 = require 'utf8'
 local lg = love.graphics
 local defaultport = 35355
 local magicstr = ' \0\r\n  \x02\n \x08\rAnYgAmE \n\n'
-local version = "0.2"
+local version = "0.2.0"
 local paths = { ip = 'ip.txt', saved = 'savedgames' }
+local namepattern = '^[a-zA-Z0-9_%-]+$'
 local ogloverun = love.run
 local ogtextinput = love.keyboard.hasTextInput()
 local framefunc
@@ -32,6 +33,26 @@ local function unserialize(s, i)
         out[k] = v
     end
     return out, i
+end
+
+local function validateVersion(v)
+    if type(v) ~= 'string' then error('received no version info', 2) end
+    local ownPieces = { version:match('^([0-9]+)%.([0-9]+)%.([0-9]+)$') }
+    for i = 1, 3 do
+        ownPieces[i] = tonumber(ownPieces[i])
+    end
+    assert(ownPieces[1] and ownPieces[2] and ownPieces[3])
+    local themPieces = { version:match('^([0-9]+)%.([0-9]+)%.([0-9]+)$') }
+    for i = 1, 3 do
+        themPieces[i] = tonumber(themPieces[i])
+    end
+    if not (themPieces[1] and themPieces[2] and themPieces[3]) then
+        error('invalid version ' .. v, 2)
+    end
+    local omaj, omin, opat = ownPieces[1], ownPieces[2], ownPieces[3]
+    local tmaj, tmin, tpat = themPieces[1], themPieces[2], themPieces[3]
+    local ok = omaj == tmaj and (omaj > 0 or omin == tmin)
+    if not ok then error('server version ' .. v .. ' is incompatible with version ' .. version, 2) end
 end
 
 local buttons = {}
@@ -226,7 +247,7 @@ local function flowShowError(err)
         local w, h = lg.getDimensions()
         local font = setFont(h * 0.1)
         lg.printf(err, 0, h * 0.35, w, 'center')
-        if button('Back', w * 0.02, h * 0.02, font:getWidth("Back"), font:getHeight()) then
+        if backbutton() then
             return
         end
     end
@@ -244,9 +265,7 @@ local function showList(list)
     return clicked
 end
 
-local function flowScanNetwork()
-
-local function flowConnectToAddress(ip)
+local function flowConnectToAddress(ip, port)
     local function draw(msg, n)
         for i = 1, n or 1 do
             framereset()
@@ -261,7 +280,7 @@ local function flowConnectToAddress(ip)
     if draw('Connecting...', 2) then return end
     local sock = socket.tcp()
     sock:settimeout(5)
-    local ok, err = sock:connect(ip, defaultport)
+    local ok, err = sock:connect(ip, port or defaultport)
     if not ok then
         sock:close()
         return flowShowError('Connection error:\n' .. err)
@@ -297,8 +316,8 @@ local function flowConnectToAddress(ip)
     local ok, metadata, zipstring = pcall(function()
         local metadata, zipstart = unserialize(fulldata)
         assert(metadata.magic == magicstr, 'invalid magic sequence')
-        assert(metadata.version, 'incompatible version')
-        assert(metadata.name and metadata.name:find('^[a-zA-Z0-9_%-]+$'))
+        validateVersion(metadata.version)
+        assert(metadata.name and metadata.name:find(namepattern))
         local zipstring = fulldata:sub(zipstart)
         assert(#zipstring > 0, 'received empty .love file')
         return metadata, zipstring
@@ -309,6 +328,157 @@ local function flowConnectToAddress(ip)
     storegame(metadata.name, zipstring)
     playgame(zipstring)
     return flowShowError('Failed to start game')
+end
+
+local function parseip(ip)
+    local a, b, c, d = ip:match('^([0-9]+)%.([0-9]+)%.([0-9]+)%.([0-9]+)$')
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if not a or not b or not c or not d then return nil end
+    if a < 0 or a > 255 or b < 0 or b > 255 or c < 0 or c > 255 or d < 0 or d > 255 then return nil end
+    return tonumber(a) * 2 ^ 24 + tonumber(b) * 2 ^ 16 + tonumber(c) * 2 ^ 8 + tonumber(d)
+end
+
+local function fmtip(ip)
+    local a = math.floor(ip / 2 ^ 24 % 256)
+    local b = math.floor(ip / 2 ^ 16 % 256)
+    local c = math.floor(ip / 2 ^ 8 % 256)
+    local d = math.floor(ip % 256)
+    return a .. '.' .. b .. '.' .. c .. '.' .. d
+end
+
+local function scanNetwork(available)
+    local freq = 500
+    local batchfreq = 5
+    local rebindperiod = 3
+    local broadperiod = 1.5
+
+    local sock
+    local nextbatch = love.timer.getTime()
+    local nextbroad = love.timer.getTime()
+    local nextrebind = love.timer.getTime()
+    local scanidx = 0
+    local baseip, bits
+    while true do
+        local now = love.timer.getTime()
+        if now >= nextrebind then
+            nextrebind = now + rebindperiod
+            -- re-create udp socket to get new local ip (useful if ie. network connects/disconnects)
+            if sock then sock:close() end
+            sock = socket.udp()
+            sock:settimeout(0)
+
+            local ipsock = socket.udp()
+            ipsock:setpeername('1.1.1.1', 80)
+            local myip = parseip(ipsock:getsockname())
+            ipsock:close()
+            baseip, bits = nil, nil
+            if math.floor(myip / 2 ^ 16) == 0xC0A8 then    -- 192.168.0.0
+                baseip, bits = 0xC0A80000, 16
+            elseif math.floor(myip / 2 ^ 20) == 0xAC1 then -- 172.16.0.0
+                baseip, bits = 0xAC100000, 20
+            elseif math.floor(myip / 2 ^ 24) == 0x0A then  -- 10.0.0.0
+                baseip, bits = 0x0A000000, 24
+            end
+            if baseip and bits then
+                print('scanning on subnet ' .. fmtip(baseip) .. '/' .. bits .. ' and subsubnets')
+            else
+                print('cannot scan: ip ' .. myip .. ' does not match private subnet pattern')
+            end
+        end
+        if now >= nextbatch then
+            nextbatch = nextbatch + 1 / batchfreq
+            local dobroadcast = now >= nextbroad
+            if dobroadcast then
+                nextbroad = nextbroad + broadperiod
+            end
+            -- send out scan batches
+            if baseip and bits then
+                local packet = metadata { what = 'scan' }
+                if dobroadcast then
+                    for subbits = bits, 8, -4 do
+                        local broadip = baseip + 2 ^ subbits - 1
+                        sock:sendto(packet, fmtip(broadip), defaultport)
+                    end
+                end
+                for j = 1, freq / batchfreq do
+                    scanidx = scanidx + 1
+                    for subbits = bits, 8, -4 do
+                        local subip = scanidx % 2 ^ subbits
+                        if subbits == 8 or subip ~= scanidx % 2 ^ (subbits - 4) then
+                            if subip > 0 and subip < 2 ^ subbits - 1 then
+                                sock:sendto(packet, fmtip(baseip + subip), defaultport)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        -- receive replies
+        for i = 1, 500 do
+            local msg, ip, port = sock:receivefrom()
+            if not msg then break end
+            local ok, meta = pcall(function()
+                local meta = unserialize(msg)
+                assert(meta.magic == magicstr, 'invalid magic')
+                validateVersion(meta.version)
+                assert(meta.name and meta.name:find(namepattern), 'invalid name')
+                return meta
+            end)
+            if ok then
+                available[ip .. ':' .. port] = {
+                    ip = ip,
+                    port = tonumber(meta.port),
+                    name = meta.name,
+                    at = love.timer.getTime(),
+                }
+            else
+                print('scan reply error: ' .. tostring(name))
+            end
+        end
+
+        if not coroutine.yield() then
+            sock:close()
+            return
+        end
+    end
+end
+
+local function flowScanNetwork()
+    local sock = socket.udp()
+    sock:setoption('reuseaddr', true)
+    sock:setoption('reuseport', true)
+    sock:settimeout(0)
+    sock:setsockname('*', defaultport)
+    local available = {}
+    local scanner = coroutine.wrap(scanNetwork)
+    while true do
+        framereset()
+        local w, h = lg.getDimensions()
+        local font = setFont(h * 0.1)
+        if backbutton() then
+            scanner()
+            return
+        end
+
+        scanner(available)
+
+        local list = {}
+        for key, server in pairs(available) do
+            list[#list + 1] = server
+        end
+        table.sort(list, function(a, b) return a.at > b.at end)
+        local strlist = {}
+        for i, server in ipairs(list) do
+            strlist[i] = server.name
+        end
+        local chosen = showList(strlist)
+        if chosen then
+            local server = list[chosen]
+            scanner()
+            return flowConnectToAddress(server.ip, server.port)
+        end
+    end
 end
 
 local function flowLoadAddress()
@@ -339,7 +509,7 @@ local function flowLoadAddress()
         local font = setFont(h * 0.1)
         lg.printf('Enter IP:', 0, h * 0.1, w, 'center')
         lg.printf(ip, 0, h * 0.2, w, 'center')
-        if button('Back', w * 0.02, h * 0.02, font:getWidth('Back'), font:getHeight()) then
+        if backbutton() then
             love.filesystem.write(paths.ip, ip)
             return
         end
@@ -392,7 +562,7 @@ local function flowMain()
         local w, h = lg.getDimensions()
         setFont(h * 0.1)
         if button('Load from network', 0, h * 0.3, w, h * 0.1) then
-            flowShowNetwork()
+            flowScanNetwork()
         end
         if button('Load from IP', 0, h * 0.4, w, h * 0.1) then
             flowLoadAddress()
