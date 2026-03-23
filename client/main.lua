@@ -22,6 +22,18 @@ local function mesh(verts)
 end
 local starmesh = mesh { 0.000, -1.000, 0.294, -0.405, 0.951, -0.309, 0.476, 0.155, 0.588, 0.809, 0.000, 0.500, -0.588, 0.809, -0.476, 0.155, -0.951, -0.309, -0.294, -0.405 }
 
+local function check(...)
+    local ok, warn = ...
+    if not ok then
+        if warn == nil then
+            warn = 'check failed'
+        else
+            warn = 'check failed: ' .. tostring(warn)
+        end
+        print(debug.traceback(warn), 2)
+    end
+    return ...
+end
 
 local function serialize(keyval)
     local n = 0
@@ -297,7 +309,7 @@ local function flowConnectToAddress(ip, port)
 
     if draw('Connecting...', 2) then return end
     local sock = socket.tcp()
-    sock:settimeout(5)
+    check(sock:settimeout(5))
     local ok, err = sock:connect(ip, port or defaultport)
     if not ok then
         sock:close()
@@ -308,9 +320,9 @@ local function flowConnectToAddress(ip, port)
         sock:close()
         return flowShowError('Connection error:\n' .. err)
     end
-    sock:shutdown('send')
+    check(sock:shutdown('send'))
 
-    sock:settimeout(0)
+    check(sock:settimeout(0))
     local fulldata = ''
     while true do
         if draw("Downloading...") then
@@ -333,7 +345,7 @@ local function flowConnectToAddress(ip, port)
     end
     local ok, metadata, zipstring = pcall(function()
         local metadata, zipstart = unserialize(fulldata)
-        assert(metadata.magic == magicstr, 'invalid magic sequence')
+        assert(metadata.magic == magicstr, 'invalid magic')
         validateVersion(metadata.version)
         assert(metadata.name and metadata.name:find(namepattern))
         local zipstring = fulldata:sub(zipstart)
@@ -385,17 +397,12 @@ local function scanNetwork(scan)
             -- re-create udp socket to get new local ip (useful if ie. network connects/disconnects)
             if sock then sock:close() end
             sock = socket.udp()
-            sock:setoption('reuseaddr', true)
-            sock:setoption('reuseport', true)
-            sock:setsockname('*', 0)
-            local ok, err = sock:setoption('broadcast', true)
-            if not ok then print("failed to set broadcast socket option: " .. tostring(err)) end
-            sock:settimeout(0)
+            check(sock:setsockname('*', 0))
+            check(sock:setoption('broadcast', true))
+            check(sock:settimeout(0))
 
             local ipsock = socket.udp()
-            ipsock:setoption('reuseaddr', true)
-            ipsock:setoption('reuseport', true)
-            ipsock:setpeername('1.1.1.1', 80)
+            check(ipsock:setpeername('1.1.1.1', 80))
             local myip = parseip(ipsock:getsockname())
             ipsock:close()
             baseip, bits = nil, nil
@@ -473,11 +480,6 @@ local function scanNetwork(scan)
 end
 
 local function flowScanNetwork()
-    local sock = socket.udp()
-    sock:setoption('reuseaddr', true)
-    sock:setoption('reuseport', true)
-    sock:settimeout(0)
-    sock:setsockname('*', defaultport)
     local scan = {}
     local scanner = coroutine.wrap(scanNetwork)
     while true do
@@ -581,6 +583,118 @@ local function fmttime(time)
     end
 end
 
+local function shareGame(game)
+    local data = love.filesystem.read(game.path)
+    print('sharing ' .. #data .. '-byte game ' .. game.path)
+    local headpacket = metadata { name = game.name }
+    local tcp = socket.tcp()
+    check(tcp:settimeout(0))
+    check(tcp:bind('*', defaultport))
+    check(tcp:listen(8))
+    local udp = socket.udp()
+    check(udp:settimeout(0))
+    check(udp:setsockname('*', defaultport))
+    local clients = {}
+
+    local function handleClient(peer)
+        local ip, port = peer:getpeername()
+        coroutine.yield()
+
+        local recv = ''
+        while true do
+            local all, err, partial = peer:receive('*a')
+            if all then
+                recv = recv .. all
+                break
+            elseif err == 'timeout' then
+                recv = recv .. partial
+                coroutine.yield()
+            else
+                error(err)
+            end
+        end
+
+        local meta = unserialize(recv)
+        assert(meta.magic == magicstr, 'invalid magic')
+        validateVersion(meta.version)
+
+        if meta.what == 'head' then
+            assert(peer:send(headpacket))
+            print('served head for ' .. ip .. ':' .. port)
+        elseif meta.what == 'get' then
+            assert(peer:send(headpacket))
+            local at = 1
+            while at <= #data do
+                local ok, err, sent = peer:send(data, at)
+                if ok then
+                    break
+                elseif err == 'timeout' then
+                    at = sent + 1
+                    coroutine.yield()
+                else
+                    error(err)
+                end
+            end
+            print('served game for ' .. ip .. ':' .. port)
+        else
+            error('received unknown "what"')
+        end
+    end
+
+    while true do
+        game = coroutine.yield()
+        if not game then
+            for _, client in pairs(clients) do
+                client.peer:close()
+            end
+            tcp:close()
+            udp:close()
+            return
+        end
+
+        for i = 1, 128 do
+            local packet, ip, port = udp:receivefrom()
+            if not packet then break end
+            local ok, err = pcall(function()
+                local meta = unserialize(packet)
+                assert(meta.magic == magicstr, 'invalid magic')
+                validateVersion(meta.version)
+                assert(meta.what == 'scan', 'unknown "what", expected "scan"')
+                assert(udp:sendto(headpacket, ip, port))
+                print('scanned by ' .. ip .. ':' .. port)
+            end)
+            if not ok then
+                print('error handling udp scan from ' .. ip .. ':' .. port .. ': ' .. tostring(err))
+            end
+        end
+
+        for i = 1, 8 do
+            local peer = tcp:accept()
+            if not peer then break end
+            local ip, port = check(peer:getsockname())
+            local co = coroutine.create(handleClient)
+            coroutine.create(handleClient)
+            assert(coroutine.resume(co, peer))
+            clients[ip .. ':' .. port] = {
+                co = co,
+                peer = peer,
+            }
+            print('new connection from ' .. ip .. ':' .. port)
+        end
+
+        for key, client in pairs(clients) do
+            local ok, err = coroutine.resume(client.co)
+            if not ok then
+                print('error serving client ' .. key .. ': ' .. err)
+            end
+            if coroutine.status(client.co) == 'dead' then
+                client.peer:close()
+                clients[key] = nil
+            end
+        end
+    end
+end
+
 local function flowSavedGames()
     local rawFiles = love.filesystem.getDirectoryItems(paths.saved)
     local games = {}
@@ -606,6 +720,7 @@ local function flowSavedGames()
     end
 
     local sharing = nil
+    local sharer = nil
     local favorites = {}
     do
         local s = love.filesystem.read(paths.fav)
@@ -629,7 +744,12 @@ local function flowSavedGames()
         framereset()
         local w, h = lg.getDimensions()
         setFont(h * 0.1)
-        if backbutton() then return end
+        if backbutton() then
+            if sharer then sharer() end
+            return
+        end
+
+        if sharer then sharer(sharing) end
 
         table.sort(games, function(a, b)
             if favorites[a.id] ~= favorites[b.id] then
@@ -669,6 +789,7 @@ local function flowSavedGames()
                         file:write(zipstring:sub(1, 1))
                         file:close()
                     end
+                    if sharer then sharer() end
                     return playgame(zipstring)
                 end
             end
@@ -687,11 +808,19 @@ local function flowSavedGames()
                 end
             end
             setFont(h * 0.035)
-            if button(sharing ~= game.id and "SHARE" or "STOP", w * 0.9 - buth, y, buth, buth) then
-                if sharing == game.id then
+            local shareText = 'SHARE'
+            if sharing == game then
+                local t = math.floor(love.timer.getTime() / 0.5) % 3
+                shareText = 'STOP\n' .. ('.'):rep(1 + t)
+            end
+            if button(shareText, w * 0.9 - buth, y, buth, buth) then
+                if sharer then sharer() end
+                if sharing == game then
                     sharing = nil
+                    sharer = nil
                 else
-                    sharing = game.id
+                    sharing = game
+                    sharer = coroutine.wrap(shareGame)
                 end
             end
             y = y + buth + 0.02 * h
