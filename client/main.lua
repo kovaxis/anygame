@@ -4,7 +4,7 @@ local lg = love.graphics
 local defaultport = 35355
 local magicstr = ' \0\r\n  \x02\n \x08\rAnYgAmE \n\n'
 local version = "0.2.0"
-local paths = { ip = 'ip.txt', saved = 'savedgames' }
+local paths = { ip = 'ip.txt', saved = 'savedgames', fav = "favorites.txt" }
 local namepattern = '^[a-zA-Z0-9_%-]+$'
 local ogloverun = love.run
 local ogtextinput = love.keyboard.hasTextInput()
@@ -239,9 +239,10 @@ local function setFont(size)
     return font
 end
 
-local function button(text, x, y, w, h)
+local function button(text, x, y, w, h, xalign, yalign)
+    xalign, yalign = xalign or 0.5, yalign or 0.5
     local f = lg.getFont()
-    lg.printf(text, x, y + h / 2 - f:getHeight() / 2, w, 'center')
+    lg.print(text, x + w * xalign - f:getWidth(text) * xalign, y + h * yalign - f:getHeight() * yalign)
     lg.rectangle('line', x, y, w, h)
     for _, press in ipairs(presses) do
         if press.x >= x and press.x < x + w and press.y >= y and press.y < y + h then
@@ -573,22 +574,47 @@ local function flowSavedGames()
             end
         end
     end
-    table.sort(games, function(a, b)
-        if a.modtime ~= b.modtime then return a.modtime > b.modtime end
-        if a.name ~= b.name then return a.name < b.name end
-        return a.hash < b.hash
-    end)
+    local countByName = {}
+    for _, game in ipairs(games) do
+        countByName[game.name] = (countByName[game.name] or 0) + 1
+    end
 
-    local favorites = {}
     local sharing = nil
+    local favorites = {}
+    do
+        local s = love.filesystem.read(paths.fav)
+        if s then
+            for sfav in s:gmatch('[^\n]+') do
+                local id, at = sfav:match('^([^:]+):([0-9]+)$')
+                at = tonumber(at)
+                if id and at then
+                    for _, game in ipairs(games) do
+                        if game.id == id then
+                            favorites[id] = at
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
 
     while true do
         framereset()
         local w, h = lg.getDimensions()
         setFont(h * 0.1)
         if backbutton() then return end
+
+        table.sort(games, function(a, b)
+            if favorites[a.id] ~= favorites[b.id] then
+                return (favorites[a.id] or 0) > (favorites[b.id] or 0)
+            end
+            if a.modtime ~= b.modtime then return a.modtime > b.modtime end
+            if a.name ~= b.name then return a.name < b.name end
+            return a.hash < b.hash
+        end)
         local y = h * 0.17
-        local buth = h * 0.13
+        local buth = h * 0.15
         for _, game in ipairs(games) do
             setFont(h * 0.08)
             lg.setColor(1, 1, 1, favorites[game.id] and 1 or 0.1)
@@ -600,12 +626,24 @@ local function flowSavedGames()
                 else
                     favorites[game.id] = os.time()
                 end
+                local s = {}
+                for id, at in pairs(favorites) do
+                    s[#s + 1] = id .. ':' .. at
+                end
+                love.filesystem.write(paths.fav, table.concat(s, '\n'))
             end
-            if button(game.name, w * 0.1 + buth, y, w * 0.8 - 2 * buth, buth) then
+            if button(game.name, w * 0.1 + buth, y, w * 0.8 - 2 * buth, buth, 0.5, 0) then
                 local zipstring = love.filesystem.read(game.path)
                 if zipstring then
                     return playgame(zipstring)
                 end
+            end
+            if countByName[game.name] > 1 then
+                local subtexth = h * 0.03
+                local margin = h * 0.01
+                setFont(subtexth)
+                lg.printf(game.hash, w * 0.1 + buth + margin, y + buth - subtexth - margin, w * 0.8 - 2 * buth - 2 *
+                    margin, 'left')
             end
             setFont(h * 0.035)
             if button(sharing ~= game.id and "SHARE" or "STOP", w * 0.9 - buth, y, buth, buth) then
