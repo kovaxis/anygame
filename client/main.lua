@@ -1,3 +1,73 @@
+local function mkprint()
+    local ogprint = print
+    local ogpresent = love.graphics.present
+
+    local fonth = nil
+    local font = nil
+    local maxlog = 64
+    local head = 0
+    local logs = {}
+
+    local function newprint(...)
+        ogprint(...)
+        local t = { ... }
+        local n = select('#', ...)
+        for i = 1, n do
+            t[i] = tostring(t[i])
+        end
+        t[n + 1] = '\n'
+        local log = table.concat(t, ' ', 1, n + 1)
+        for line in log:gmatch('[^\n]*\n') do
+            head = head + 1
+            if head > maxlog then head = 1 end
+            logs[head] = log
+        end
+    end
+
+    local function newpresent()
+        local ogfont = love.graphics.getFont()
+        local r, g, b, a = love.graphics.getColor()
+        love.graphics.push()
+
+        local dpi = love.window.getDPIScale()
+        local fw, fh = love.graphics.getDimensions()
+        local sx, sy, sw, sh = love.window.getSafeArea()
+        local wanth = math.ceil(fh / maxlog * dpi) / dpi
+        if wanth ~= fonth then
+            fonth = wanth
+            font = love.graphics.newFont(fonth)
+        end
+
+        love.graphics.setFont(font)
+        love.graphics.setColor(1, 1, 1)
+
+        love.graphics.origin()
+        local margin = sh * 0.01
+        local y = sy + sh - margin
+        for i = 1, maxlog do
+            if y <= 0 then break end
+            local j = head + 1 - i
+            if j <= 0 then
+                j = j + maxlog
+            end
+            local log = logs[j]
+            if log then
+                y = y - fonth
+                love.graphics.print(log, sx + margin, y)
+            end
+        end
+
+        love.graphics.pop()
+        love.graphics.setColor(r, g, b, a)
+        love.graphics.setFont(ogfont)
+        return ogpresent()
+    end
+
+    return newprint, newpresent
+end
+
+local print, presentwrap = mkprint()
+
 local socket = require 'socket'
 local utf8 = require 'utf8'
 local lg = love.graphics
@@ -10,6 +80,10 @@ local namepattern = '^[a-zA-Z0-9_%-]+$'
 local ogloverun = love.run
 local ogtextinput = love.keyboard.hasTextInput()
 local framefunc
+local msglimit = 1024 * 1024 * 1024
+
+print('anygame version: ' .. tostring(version))
+print('luasocket version: ' .. tostring(socket._VERSION))
 
 local function mesh(verts)
     local tris = love.math.triangulate(verts)
@@ -36,31 +110,6 @@ local function check(...)
     return ...
 end
 
-local function serialize(keyval)
-    local n = 0
-    for k, v in pairs(keyval) do
-        n = n + 1
-    end
-    local s = love.data.pack('string', '<I2', n)
-    for k, v in pairs(keyval) do
-        s = s .. love.data.pack('string', '<s2s2', k, v)
-    end
-    return s
-end
-
-local function unserialize(s, i)
-    i = i or 1
-    local n
-    n, i = love.data.unpack('<I2', s, i)
-    local out = {}
-    for j = 1, n do
-        local k, v
-        k, v, i = love.data.unpack('<s2s2', s, i)
-        out[k] = v
-    end
-    return out, i
-end
-
 local function validateVersion(v)
     if type(v) ~= 'string' then error('received no version info', 2) end
     local ownPieces = { version:match('^([0-9]+)%.([0-9]+)%.([0-9]+)$') }
@@ -81,13 +130,96 @@ local function validateVersion(v)
     if not ok then error('server version ' .. v .. ' is incompatible with version ' .. version, 2) end
 end
 
+local function serialize(keyval)
+    keyval.version = version
+    local t = { magicstr, '' }
+    local n = 0
+    for k, v in pairs(keyval) do
+        n = n + 4 + #k + 4 + #v
+        assert(n <= msglimit, 'too large')
+        local s = love.data.pack('string', '<s4s4', k, v)
+        t[#t + 1] = s
+    end
+    t[2] = love.data.pack('string', '<I4', n)
+    return table.concat(t)
+end
+
+local function unserialize(s, i)
+    i = i or 1
+    local out = {}
+    while i <= #s do
+        local k, v
+        k, v, i = love.data.unpack('<s4s4', s, i)
+        out[k] = v
+    end
+    return out
+end
+
+local function downloadn(sock, n, wait)
+    wait = wait or coroutine.yield
+    local buf = ''
+    while #buf < n do
+        local all, err, piece = sock:receive(n - #buf)
+        if all then
+            buf = buf .. all
+            return buf
+        elseif err == 'timeout' then
+            buf = buf .. piece
+            wait()
+        else
+            error(err, 2)
+        end
+    end
+end
+
+local function download(sock, wait)
+    wait = wait or coroutine.yield
+    local prefix = downloadn(sock, #magicstr + 4, wait)
+    assert(prefix:sub(1, #magicstr) == magicstr, 'invalid magic')
+    local len = love.data.unpack('<I4', prefix:sub(#magicstr + 1))
+    assert(len <= msglimit, 'too large')
+    local payload = downloadn(sock, len, wait)
+    local data = unserialize(payload)
+    validateVersion(data.version)
+    return data
+end
+
+local function parse(packet)
+    local m = #magicstr
+    assert(packet:sub(1, m) == magicstr, 'invalid magic')
+    assert(love.data.unpack('<I4', packet:sub(m + 1, m + 4)) == #packet - m - 4, 'invalid length')
+    local data = unserialize(packet, m + 4 + 1)
+    validateVersion(data.version)
+    return data
+end
+
+local function upload(sock, data, wait)
+    wait = wait or coroutine.yield
+    local packet = data
+    if type(data) ~= 'string' then
+        packet = serialize(data)
+    end
+    local i = 1
+    while true do
+        local ok, err, sent = sock:send(packet, i)
+        if ok then
+            return
+        elseif err == 'timeout' then
+            i = sent + 1
+            wait()
+        else
+            error(err, 2)
+        end
+    end
+end
+
 local buttons = {}
 local fontcache = {}
 local events = {}
 local pointers = {}
 local presses = {}
 
-local function playgame(zipstring, preload)
+local function playgame(zipstring, preload, preloadArgs)
     print("playing " .. #zipstring .. " byte game")
     local zipdata = love.data.newByteData(zipstring)
     local success = love.filesystem.mount(zipdata, "gamezip", "", false)
@@ -101,7 +233,7 @@ local function playgame(zipstring, preload)
         print('loading ' .. #preload .. '-byte preload:')
         print(preload)
         local preloadfn = assert(load(preload, 'preload'))
-        preloadfn()
+        preloadfn(preloadArgs or {})
     end
     if love.filesystem.getInfo("conf.lua") then
         local t = {}
@@ -284,6 +416,7 @@ local function storegame(name, zipstring)
         while #games >= maxsavedgamecache do
             local ok = check(love.filesystem.remove(games[#games].path))
             if not ok then break end
+            games[#games] = nil
         end
     end
 
@@ -297,12 +430,6 @@ local function storegame(name, zipstring)
     end
 
     return path
-end
-
-local function metadata(data)
-    data.magic = magicstr
-    data.version = version
-    return serialize(data)
 end
 
 local function framereset(handler)
@@ -421,49 +548,39 @@ local function flowConnectToAddress(ip, port)
         sock:close()
         return flowShowError('Connection error:\n' .. err)
     end
-    ok, err = sock:send(metadata { what = "get" })
-    if not ok then
-        sock:close()
-        return flowShowError('Connection error:\n' .. err)
-    end
-    check(sock:shutdown('send'))
-
     check(sock:settimeout(0))
-    local fulldata = ''
-    while true do
-        if draw("Downloading...") then
-            sock:close()
-            return
+    local ok, msg = pcall(function()
+        local status = 'Preparing...'
+        local function wait()
+            if draw(status) then
+                error(sock)
+            end
         end
-        local all, err, piece = sock:receive('*a')
-        if all then
-            fulldata = fulldata .. all
-            break
-        elseif err == 'timeout' then
-            fulldata = fulldata .. piece
-        else
-            return flowShowError('Error downloading game:\n' .. err)
-        end
-    end
-    sock:close()
-    if #fulldata == 0 then
-        return flowShowError('Error downloading game:\nempty')
-    end
-    local ok, metadata, zipstring = pcall(function()
-        local metadata, zipstart = unserialize(fulldata)
-        assert(metadata.magic == magicstr, 'invalid magic')
-        validateVersion(metadata.version)
-        assert(metadata.name and metadata.name:find(namepattern))
-        local zipstring = fulldata:sub(zipstart)
-        assert(#zipstring > 0, 'received empty .love file')
-        return metadata, zipstring
+        upload(sock, { what = 'get' }, wait)
+        status = 'Downloading...'
+        local msg = download(sock, wait)
+        assert(msg.name and msg.name:find(namepattern), 'invalid name')
+        assert(msg.zip and #msg.zip > 0, 'invalid zip')
+        return msg
     end)
     if not ok then
-        return flowShowError('Error downloading game:\n' .. metadata)
+        sock:close()
+        if msg == sock then
+            return
+        else
+            return flowShowError('Connection error\n' .. tostring(msg))
+        end
     end
-    local path = storegame(metadata.name, zipstring)
+    if not msg.keep then
+        sock:close()
+    end
+    local path = storegame(msg.name, msg.zip)
     check(love.filesystem.write(paths.last, path .. ';' .. ip .. ';' .. port))
-    playgame(zipstring, metadata.preload)
+    playgame(msg.zip, msg.preload, {
+        ip = ip,
+        port = port,
+        socket = msg.keep and socket or nil,
+    })
     return flowShowError('Failed to start game')
 end
 
@@ -484,16 +601,19 @@ local function fmtip(ip)
 end
 
 local function scanNetwork(scan)
-    local freq = 500
+    local unifreq = 10
     local batchfreq = 5
     local rebindperiod = 5
     local broadperiod = 1.5
 
     local sock
+    local scanpacket = serialize { what = 'scan' }
     local nextbatch = love.timer.getTime()
+    local nextuni = love.timer.getTime()
     local nextbroad = love.timer.getTime()
     local nextrebind = love.timer.getTime()
-    local scanidx = 0
+    local scanidx = 10
+    local scanbits = 100
     local baseip, bits
     scan.available = {}
     scan.active = false
@@ -504,14 +624,16 @@ local function scanNetwork(scan)
             -- re-create udp socket to get new local ip (useful if ie. network connects/disconnects)
             if sock then sock:close() end
             sock = socket.udp()
-            check(sock:setsockname('*', 0))
-            check(sock:setoption('broadcast', true))
             check(sock:settimeout(0))
+            check(sock:setsockname('0.0.0.0', 0))
+            print('scanning from socket:', sock:getsockname())
+            check(sock:setoption('broadcast', true))
 
             local ipsock = socket.udp()
-            check(ipsock:setpeername('1.1.1.1', 80))
-            local myip = parseip(ipsock:getsockname())
+            ipsock:setpeername('1.1.1.1', 80)
+            local mystrip = check(ipsock:getsockname()) or 0
             ipsock:close()
+            local myip = parseip(mystrip) or 0
             baseip, bits = nil, nil
             if math.floor(myip / 2 ^ 16) == 0xC0A8 then    -- 192.168.0.0
                 baseip, bits = 0xC0A80000, 16
@@ -521,57 +643,83 @@ local function scanNetwork(scan)
                 baseip, bits = 0x0A000000, 24
             end
             if baseip and bits then
-                print('scanning on subnet ' .. fmtip(baseip) .. '/' .. bits .. ' and subsubnets')
+                print('scanning on subnet ' ..
+                    fmtip(baseip) .. '/' .. bits .. ' and subsubnets (own ip is ' .. mystrip .. ')')
             else
-                print('cannot scan: ip ' .. myip .. ' does not match private subnet pattern')
+                print('cannot scan: ip ' .. mystrip .. ' does not match private subnet pattern')
             end
             scan.active = baseip and bits
         end
-        if now >= nextbatch then
-            nextbatch = nextbatch + 1 / batchfreq
-            local dobroadcast = now >= nextbroad
-            if dobroadcast then
-                nextbroad = nextbroad + broadperiod
-            end
-            -- send out scan batches
+        if now >= nextbroad then
+            nextbroad = math.max(now, nextbroad + broadperiod)
+            -- send out messages to broadcast ips
             if baseip and bits then
-                local packet = metadata { what = 'scan' }
-                if dobroadcast then
-                    for subbits = bits, 8, -4 do
-                        local broadip = baseip + 2 ^ subbits - 1
-                        sock:sendto(packet, fmtip(broadip), defaultport)
+                for subbits = bits, 8, -4 do
+                    local broadip = baseip + 2 ^ subbits - 1
+                    local ip = fmtip(broadip)
+                    local ok, err = sock:sendto(scanpacket, ip, defaultport)
+                    if not ok then print('broadcast to ' .. ip .. ' failed: ' .. tostring(err)) end
+                end
+            end
+        end
+        if now >= nextbatch then
+            nextbatch = math.max(now, nextbatch + 1 / batchfreq)
+            -- send out unicast scans
+            if baseip and bits then
+                local batchsize = 0
+                while now >= nextuni do
+                    nextuni = math.max(now - math.max(1 / batchfreq, 1 / unifreq), nextuni + 1 / unifreq)
+
+                    ::retry::
+                    scanbits = scanbits + 4
+                    if scanbits > bits then
+                        scanbits = 8
+                        scanidx = scanidx + 1
+                    end
+                    local subip = scanidx % 2 ^ scanbits
+                    if scanbits > 8 and subip == scanidx % 2 ^ (scanbits - 4) then
+                        goto retry
+                    end
+                    if subip == 0 or subip == 2 ^ scanbits - 1 then
+                        goto retry
+                    end
+
+                    local ip = fmtip(baseip + subip)
+                    local ok, err = sock:sendto(scanpacket, ip, defaultport)
+                    batchsize = batchsize + 1
+                    if not ok then
+                        -- slow down
+                        unifreq = unifreq / 2
+                        nextuni = math.max(nextuni, now)
+                        print('unicast failure, reduced unicast freq to ' .. unifreq)
+                        print('  ip:', ip)
+                        print('  batch size:', batchsize)
+                        print('  sockname:', sock:getsockname())
+                        print('  peername:', pcall(sock.getpeername, sock))
+                        print('  error:', err)
+                        goto skipscan
                     end
                 end
-                for j = 1, freq / batchfreq do
-                    scanidx = scanidx + 1
-                    for subbits = bits, 8, -4 do
-                        local subip = scanidx % 2 ^ subbits
-                        if subbits == 8 or subip ~= scanidx % 2 ^ (subbits - 4) then
-                            if subip > 0 and subip < 2 ^ subbits - 1 then
-                                sock:sendto(packet, fmtip(baseip + subip), defaultport)
-                            end
-                        end
-                    end
-                end
+                incrpersec = 5
+                unifreq = unifreq + incrpersec / batchfreq
+                ::skipscan::
             end
         end
 
         -- receive replies
         for i = 1, 500 do
-            local msg, ip, port = sock:receivefrom()
-            if not msg then break end
-            local ok, meta = pcall(function()
-                local meta = unserialize(msg)
-                assert(meta.magic == magicstr, 'invalid magic')
-                validateVersion(meta.version)
-                assert(meta.name and meta.name:find(namepattern), 'invalid name')
-                return meta
+            local packet, ip, port = sock:receivefrom()
+            if not packet then break end
+            local ok, msg = pcall(function()
+                local msg = parse(packet)
+                assert(msg.name and msg.name:find(namepattern), 'invalid name')
+                return msg
             end)
             if ok then
                 scan.available[ip .. ':' .. port] = {
                     ip = ip,
-                    port = tonumber(meta.port),
-                    name = meta.name,
+                    port = tonumber(msg.port),
+                    name = msg.name,
                     at = love.timer.getTime(),
                 }
             else
@@ -580,7 +728,7 @@ local function scanNetwork(scan)
         end
 
         if not coroutine.yield() then
-            sock:close()
+            if sock then sock:close() end
             return
         end
     end
@@ -645,8 +793,9 @@ local function flowScanNetwork()
     end
 end
 
-local function flowLoadAddress()
+local function flowEnterIp()
     local ip = love.filesystem.read(paths.ip) or ''
+    love.keyboard.setTextInput(true)
     while true do
         framereset(function(ev, a, b, c, d, e, f)
             if ev == 'textinput' then
@@ -671,10 +820,11 @@ local function flowLoadAddress()
         end
         local w, h = lg.getDimensions()
         setFont(h * 0.1)
-        lg.printf('Enter IP:', 0, h * 0.1, w, 'center')
-        lg.printf(ip, 0, h * 0.2, w, 'center')
+        lg.printf('Enter IP:', 0, h * 0.1, w / 2 - w * 0.01, 'right')
+        lg.printf(ip, w / 2 + w * 0.01, h * 0.1, w / 2 - w * 0.01, 'left')
         if backbutton() then
             check(love.filesystem.write(paths.ip, ip))
+            love.keyboard.setTextInput(false)
             return
         end
     end
@@ -709,55 +859,28 @@ end
 local function shareGame(game)
     local data = assert(love.filesystem.read(game.path))
     print('sharing ' .. #data .. '-byte game ' .. game.path)
-    local headpacket = metadata { name = game.name }
+    local headpacket = serialize { name = game.name }
     local tcp = socket.tcp()
     check(tcp:settimeout(0))
-    check(tcp:bind('*', defaultport))
+    check(tcp:bind('0.0.0.0', defaultport))
     check(tcp:listen(8))
+    print('tcp listening on', tcp:getsockname())
     local udp = socket.udp()
     check(udp:settimeout(0))
-    check(udp:setsockname('*', defaultport))
+    check(udp:setsockname('0.0.0.0', defaultport))
+    print('udp listening on', udp:getsockname())
     local clients = {}
 
     local function handleClient(peer)
         local ip, port = peer:getpeername()
         coroutine.yield()
 
-        local recv = ''
-        while true do
-            local all, err, partial = peer:receive('*a')
-            if all then
-                recv = recv .. all
-                break
-            elseif err == 'timeout' then
-                recv = recv .. partial
-                coroutine.yield()
-            else
-                error(err)
-            end
-        end
-
-        local meta = unserialize(recv)
-        assert(meta.magic == magicstr, 'invalid magic')
-        validateVersion(meta.version)
-
-        if meta.what == 'head' then
-            assert(peer:send(headpacket))
+        local msg = download(peer)
+        if msg.what == 'head' then
+            upload(peer, headpacket)
             print('served head for ' .. ip .. ':' .. port)
-        elseif meta.what == 'get' then
-            assert(peer:send(headpacket))
-            local at = 1
-            while at <= #data do
-                local ok, err, sent = peer:send(data, at)
-                if ok then
-                    break
-                elseif err == 'timeout' then
-                    at = sent + 1
-                    coroutine.yield()
-                else
-                    error(err)
-                end
-            end
+        elseif msg.what == 'get' then
+            upload(peer, { name = game.name, zip = data })
             print('served game for ' .. ip .. ':' .. port)
         else
             error('received unknown "what"')
@@ -779,10 +902,8 @@ local function shareGame(game)
             local packet, ip, port = udp:receivefrom()
             if not packet then break end
             local ok, err = pcall(function()
-                local meta = unserialize(packet)
-                assert(meta.magic == magicstr, 'invalid magic')
-                validateVersion(meta.version)
-                assert(meta.what == 'scan', 'unknown "what", expected "scan"')
+                local msg = parse(packet)
+                assert(msg.what == 'scan', 'unknown "what", expected "scan"')
                 assert(udp:sendto(headpacket, ip, port))
                 print('scanned by ' .. ip .. ':' .. port)
             end)
@@ -794,15 +915,16 @@ local function shareGame(game)
         for i = 1, 8 do
             local peer = tcp:accept()
             if not peer then break end
-            local ip, port = check(peer:getsockname())
+            local ip, port = check(peer:getpeername())
+            local key = ip .. ':' .. port
             local co = coroutine.create(handleClient)
-            coroutine.create(handleClient)
             assert(coroutine.resume(co, peer))
-            clients[ip .. ':' .. port] = {
+            check(not clients[key], 'duplicate client ' .. key)
+            clients[key] = {
                 co = co,
                 peer = peer,
             }
-            print('new connection from ' .. ip .. ':' .. port)
+            print('new connection from ' .. key)
         end
 
         for key, client in pairs(clients) do
@@ -943,6 +1065,16 @@ local function flowMain()
         local w, h = lg.getDimensions()
         setFont(h * 0.2)
         lg.printf("Anygame", 0, h * 0.1, w, 'center')
+        for _, ev in ipairs(events) do
+            local name, x, y, presses = ev[1], ev[2], ev[3], ev[6]
+            if name == 'mousepressed' and y < h * 0.4 and presses >= 7 then
+                if _G.print ~= print then
+                    _G.print = print
+                    love.graphics.present = presentwrap
+                    print('showing logs on-screen')
+                end
+            end
+        end
         setFont(h * 0.1)
         local itemh = h * 0.1
         local stride = itemh + h * 0.02
@@ -951,6 +1083,8 @@ local function flowMain()
             local text = 'Continue'
             if last.type == 'path' and last.ip then
                 text = text .. ' offline'
+            elseif last.type == 'net' then
+                text = 'Reconnect'
             end
             if button(text, w * 0.1, y - stride, w * 0.8, itemh) then
                 if last.type == 'net' then
@@ -966,7 +1100,7 @@ local function flowMain()
         end
         y = y + stride
         if button('Load from IP', w * 0.1, y, w * 0.8, itemh) then
-            flowLoadAddress()
+            flowEnterIp()
         end
         y = y + stride
         if button('Saved games', w * 0.1, y, w * 0.8, itemh) then
