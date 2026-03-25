@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
 from collections import defaultdict
+from io import BytesIO
 from pathlib import Path
 import random
 import re
-import subprocess
+import zipfile
 import socket
 from threading import Thread
 import time
 import traceback
-import os
 import sys
 import struct
 
@@ -33,6 +33,7 @@ if anygame.ip and anygame.port then
         local socket = require 'socket'
         local args = ...
         local sock
+        local mtime = args.mtime
 
         local cooldown = 1
 
@@ -124,6 +125,7 @@ if anygame.ip and anygame.port then
                     local data = love.data.newByteData(msg.zip)
                     local success = love.filesystem.mount(data, "gamezip_patch"..patchVersion, "", false)
                     if success then
+                        mtime = msg.mtime
                         print('applied '..#msg.zip..'-byte anygame live patch')
                     else
                         print('anygame failed to mount '..#msg.zip..' live patch')
@@ -155,7 +157,7 @@ if anygame.ip and anygame.port then
                 sock = socket.tcp()
                 check(sock:settimeout(5))
                 assert(sock:connect(args.ip, args.port))
-                upload(sock, { what = 'stream' }, nil, true)
+                upload(sock, { what = 'stream', mtime = mtime }, nil, true)
                 local hello = download(sock, nil, true)
                 assert(hello.what == 'stream', 'invalid "what", expected "stream"')
                 cooldown = 1
@@ -198,6 +200,7 @@ if anygame.ip and anygame.port then
         onpatch = onpatch,
         ip = anygame.ip,
         port = anygame.port,
+        mtime = anygame.message.mtime,
         options = _options,
     }
 
@@ -245,32 +248,60 @@ for option in args[1:]:
     if key not in options:
         print(f"unknown option {option}")
         sys.exit(1)
-    del options[key]
+    options.discard(key)
 if options:
     preload = (
         f"local _options = {{{','.join(f'{opt} = true' for opt in options)}}}"
         + keepconnection
     )
 
-gamedir = args[0]
-if not Path(gamedir).exists():
+gamedir = Path(args[0])
+if not gamedir.exists():
     print("path '" + gamedir + "' does not exist")
     sys.exit(1)
-gamename, _ = re.subn(r"[^a-zA-Z0-9_-]", "", Path(gamedir).name)
+gamename, _ = re.subn(r"[^a-zA-Z0-9_-]", "", gamedir.name)
 
 
-def packgame():
-    zippath = Path.cwd().joinpath("game.zip")
-    try:
-        if zippath.exists():
-            os.remove(zippath)
-        out = subprocess.call(["zip", "-r", str(zippath), "."], cwd=gamedir)
-        assert out == 0
-        gamedata = zippath.read_bytes()
-    finally:
-        if zippath.exists():
-            os.remove(zippath)
-    return gamedata
+def scangame():
+    dirs = []
+    files = []
+    newest = 0
+
+    def visit(src: Path, dst):
+        nonlocal newest
+        if src.name.startswith("."):
+            return -1
+        mtime = src.stat().st_mtime or 0
+        if src.is_dir():
+            for itemsrc in src.iterdir():
+                itemdst = itemsrc.name if dst == "" else dst + "/" + itemsrc.name
+                item_mtime = visit(itemsrc, itemdst)
+                mtime = max(mtime, item_mtime)
+            dirs.append((mtime, "dir", dst))
+            newest = max(newest, mtime)
+            return mtime
+        elif src.is_file():
+            files.append((mtime, "file", src, dst))
+            newest = max(newest, mtime)
+            return mtime
+        return -1
+
+    visit(gamedir, "")
+
+    return dirs + files, newest
+
+
+def packgame(scan, since=-1):
+    encodedzip = BytesIO()
+    with zipfile.ZipFile(encodedzip, mode="w", compression=zipfile.ZIP_DEFLATED) as zip:
+        for item in scan:
+            if item[0] > since:
+                if item[1] == "dir":
+                    zip.mkdir(item[2])
+                elif item[1] == "file":
+                    zip.write(item[2], item[3])
+
+    return encodedzip.getvalue()
 
 
 def serialize(data, stream=False):
@@ -355,6 +386,7 @@ def parse(packet):
 clientlist = []
 serving = set()
 max_serving = 32
+curscan = scangame()
 
 
 def check(cond, err):
@@ -387,39 +419,72 @@ def announce():
                 traceback.print_exc()
 
 
+def scanner():
+    global curscan
+    while True:
+        time.sleep(2)
+        curscan = scangame()
+
+
 def serve(peer, addr):
     try:
         print("serving connection from", addr)
+        peer.settimeout(5)
         req = download(peer)
         if str(addr) not in clientlist:
             clientlist.append(addr[0] + ":" + str(addr[1]))
         if req["what"] == "head":
             peer.sendall(serialize({"name": gamename}))
+            return
         elif req["what"] == "get":
             print("serving game to", addr)
+            scan = curscan
+            mtime = scan[1]
             peer.sendall(
                 serialize(
                     {
                         "name": gamename,
-                        "zip": packgame(),
+                        "zip": packgame(scan[0]),
+                        "mtime": str(scan[1]),
                         **({"preload": preload} if preload else {}),
                     }
                 )
             )
         elif req["what"] == "stream":
             print("serving stream to ", addr)
+            try:
+                mtime = float(req["mtime"] or "")
+            except ValueError:
+                mtime = time.time() - 5
             peer.sendall(serialize({"what": "stream"}))
         else:
-            check(False, f'unknown "what": {req["what"]}')
+            return check(False, f'unknown "what": {req["what"]}')
 
         colors = [31, 32, 33, 34, 35, 36, 37, 91, 92, 93, 94, 95, 96, 97]
         c = colors[random.randint(0, len(colors) - 1)]
         prefix = str(addr[0]) + ":" + str(addr[1])
         prefix = f"\033[1;{c}m[{prefix}]\033[0m "
 
+        peer.settimeout(0.5)
         while True:
             try:
                 msg = download(peer, True)
+            except TimeoutError:
+                scan = curscan
+                if scan[1] > mtime:
+                    print(f"sending updates to {addr} from {mtime} to {scan[1]}")
+                    peer.sendall(
+                        serialize(
+                            {
+                                "what": "patch",
+                                "zip": packgame(scan[0], mtime),
+                                "mtime": str(scan[1]),
+                            },
+                            True,
+                        )
+                    )
+                    mtime = scan[1]
+                continue
             except EOFError:
                 break
             if msg["what"] == "log":
@@ -436,13 +501,15 @@ def serve(peer, addr):
         serving.discard(str(addr))
 
 
+if "files" in options:
+    Thread(target=scanner).start()
 Thread(target=announce).start()
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", defaultport))
     sock.listen()
-    print("serving '" + gamedir + "'")
+    print("serving '" + str(gamedir) + "'")
     while True:
         peer, addr = sock.accept()
         if len(serving) >= max_serving:

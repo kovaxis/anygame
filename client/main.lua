@@ -227,8 +227,7 @@ local function playgame(zipstring, preload, preloadArgs)
     love.keyboard.setTextInput(ogtextinput)
     love.run = ogloverun
     if preload then
-        print('loading ' .. #preload .. '-byte preload:')
-        print(preload)
+        print('loading ' .. #preload .. '-byte preload')
         local preloadfn = assert(load(preload, 'preload'))
         preloadfn(preloadArgs or {})
     end
@@ -579,6 +578,7 @@ local function flowConnectToAddress(ip, port)
         socket = msg.keep and sock or nil,
         magic = magicstr,
         version = version,
+        message = msg,
     })
     return flowShowError('Failed to start game')
 end
