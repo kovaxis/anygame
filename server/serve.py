@@ -20,17 +20,14 @@ msglimit = 1024 * 1024 * 1024
 
 options = {}
 
-# this is keepconnection line 0
 keepconnection = r"""
+assert(_options)
 local anygame = ...
 
 _G._anygame = anygame
 
 if anygame.ip and anygame.port then
-    local send = love.thread.newChannel()
-    local recv = love.thread.newChannel()
-
-    local thread = love.thread.newThread(love.filesystem.newFileData([[ -- this is thread line 0
+    local thread = love.thread.newThread(love.filesystem.newFileData([[
         require 'love.timer'
         require 'love.data'
         local socket = require 'socket'
@@ -118,10 +115,23 @@ if anygame.ip and anygame.port then
             end
         end
 
+        local patchVersion = 0
         local function downloadloop()
             while true do
                 local msg = download(sock, coroutine.yield)
-                args.recv:push(msg)
+                if args.options.files and msg.what == 'patch' and msg.zip then
+                    patchVersion = patchVersion + 1
+                    local data = love.data.newByteData(msg.zip)
+                    local success = love.filesystem.mount(data, "gamezip_patch"..patchVersion, "", false)
+                    if success then
+                        print('applied '..#msg.zip..'-byte anygame live patch')
+                    else
+                        print('anygame failed to mount '..#msg.zip..' live patch')
+                    end
+                    if args.onpatch:getCount() < 1024 then
+                        args.onpatch:push(true)
+                    end
+                end
                 coroutine.yield()
             end
         end
@@ -178,135 +188,47 @@ if anygame.ip and anygame.port then
         print('exiting anygame network thread')
     ]], 'anygame-network-thread'))
 
+    local send = love.thread.newChannel()
+    local onpatch = love.thread.newChannel()
+
     thread:start {
         magic = anygame.magic,
         version = anygame.version,
         send = send,
-        recv = recv,
+        onpatch = onpatch,
         ip = anygame.ip,
         port = anygame.port,
+        options = _options,
     }
 
-    anygame.send = send
-    anygame.receive = recv
     anygame.networkthread = thread
+
+    if _options.logs then
+        local ogprint = _G.print
+        _G.print = function(...)
+            ogprint(...)
+            local log = table.concat({...}, ' ', 1, select('#', ...))
+            send:push({ what = 'log', log = log })
+        end
+    end
+
+    if _options.files then
+        function anygame.checkForPatches()
+            local patched = false
+            while true do
+                local p = onpatch:pop()
+                if not p then break end
+                patched = true
+            end
+            return patched
+        end
+    end
 else
     print('no ip/port, cannot connect back to anygame server')
 end
 """
 
-options["logs"] = r"""
-do
-    local ogprint = _G.print
-    _G.print = function(...)
-        ogprint(...)
-        local log = table.concat({...}, ' ', 1, select('#', ...))
-        anygame.send:push({ what = 'log', log = log })
-    end
-end
-"""
-
-options["live"] = r"""
-magic = " \0\r\n  \x02\n \x08\rAnYgAmE \n\n"
-version = "0.2.0"
-
-
-local args = ...
-if not _G._anygame then _G._anygame = {} end
-
-local threadSrc = [[
-require 'love.timer'
-local socket = require 'socket'
-
-local function serialize(keyval)
-    local n = 0
-    for k, v in pairs(keyval) do
-        n = n + 1
-    end
-    local s = love.data.pack('string', '<I2', n)
-    for k, v in pairs(keyval) do
-        s = s .. love.data.pack('string', '<s2s2', k, v)
-    end
-    return s
-end
-
-local function unserialize(s, i)
-    i = i or 1
-    local n
-    n, i = love.data.unpack('<I2', s, i)
-    local out = {}
-    for j = 1, n do
-        local k, v
-        k, v, i = love.data.unpack('<s2s2', s, i)
-        out[k] = v
-    end
-    return out, i
-end
-
-local ip, port, updates, control = ...
-
-local quit = false
-
-while true do
-    local ok, err = pcall(function()
-        local sock = socket.tcp()
-        assert(sock:connect(args.ip, args.port))
-        assert(sock:send(serialize {
-            magic = magic,
-            version = version,
-            what = 'live',
-        }))
-        assert(sock:shutdown('send'))
-        while not quit do
-            while true do
-                local ctrl = control:pop()
-                if not ctrl then break end
-                if ctrl == 'quit' then
-                    quit = true
-                end
-            end
-            if quit then break end
-
-            local lenRaw = assert(sock:receive(2))
-            local len = love.data.unpack('<I2', lenRaw)
-            local metaRaw = assert(sock:receive(len))
-            local meta = unserialize(metaRaw)
-            assert(meta.magic == magic, 'invalid magic')
-            assert(meta.version, 'no version')
-            if meta.what == 'update' then
-                local size = assert(tonumber(meta.size), 'no size')
-                local zipstr = sock:receive(size)
-                updates:push(zipstr)
-            else
-                print('received unknown "what": '..tostring(meta.what))
-            end
-        end
-    end)
-    if ok then
-        break
-    else
-        print("_anygame.live error: "..tostring(err))
-        love.timer.sleep(5)
-    end
-end
-]]
-
-function _anygame.live()
-    if not args.ip or not args.port then
-        return nil, 'no ip/port, cannot connect for live stream'
-        return
-    end
-    local updates = love.thread.newChannel()
-    local control = love.thread.newChannel()
-    local thread = love.thread.newThread(threadSrc)
-    thread:start(args.ip, args.port, updates, control)
-    return {
-        updates = updates,
-        control = control,
-        thread = thread,
-    }
-end
-"""
+options = {"logs", "files"}
 
 args = sys.argv[1:]
 
@@ -316,16 +238,19 @@ if len(args) < 1:
 
 preload = ""
 for option in args[1:]:
-    if not option.startswith("--"):
+    if not option.startswith("--no-"):
         print(f"unexpected argument {option}")
         sys.exit(1)
-    key = option[2:]
+    key = option[5:]
     if key not in options:
         print(f"unknown option {option}")
         sys.exit(1)
-    preload += options[key]
-if preload:
-    preload = keepconnection + preload
+    del options[key]
+if options:
+    preload = (
+        f"local _options = {{{','.join(f'{opt} = true' for opt in options)}}}"
+        + keepconnection
+    )
 
 gamedir = args[0]
 if not Path(gamedir).exists():
