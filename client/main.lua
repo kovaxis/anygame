@@ -156,7 +156,6 @@ local function unserialize(s, i)
 end
 
 local function downloadn(sock, n, wait)
-    wait = wait or coroutine.yield
     local buf = ''
     while #buf < n do
         local all, err, piece = sock:receive(n - #buf)
@@ -165,7 +164,7 @@ local function downloadn(sock, n, wait)
             return buf
         elseif err == 'timeout' then
             buf = buf .. piece
-            wait()
+            if wait then wait() end
         else
             error(err, 2)
         end
@@ -173,7 +172,6 @@ local function downloadn(sock, n, wait)
 end
 
 local function download(sock, wait)
-    wait = wait or coroutine.yield
     local prefix = downloadn(sock, #magicstr + 4, wait)
     assert(prefix:sub(1, #magicstr) == magicstr, 'invalid magic')
     local len = love.data.unpack('<I4', prefix:sub(#magicstr + 1))
@@ -194,7 +192,6 @@ local function parse(packet)
 end
 
 local function upload(sock, data, wait)
-    wait = wait or coroutine.yield
     local packet = data
     if type(data) ~= 'string' then
         packet = serialize(data)
@@ -206,7 +203,7 @@ local function upload(sock, data, wait)
             return
         elseif err == 'timeout' then
             i = sent + 1
-            wait()
+            if wait then wait() end
         else
             error(err, 2)
         end
@@ -579,7 +576,9 @@ local function flowConnectToAddress(ip, port)
     playgame(msg.zip, msg.preload, {
         ip = ip,
         port = port,
-        socket = msg.keep and socket or nil,
+        socket = msg.keep and sock or nil,
+        magic = magicstr,
+        version = version,
     })
     return flowShowError('Failed to start game')
 end
@@ -875,12 +874,12 @@ local function shareGame(game)
         local ip, port = peer:getpeername()
         coroutine.yield()
 
-        local msg = download(peer)
+        local msg = download(peer, coroutine.yield)
         if msg.what == 'head' then
-            upload(peer, headpacket)
+            upload(peer, headpacket, coroutine.yield)
             print('served head for ' .. ip .. ':' .. port)
         elseif msg.what == 'get' then
-            upload(peer, { name = game.name, zip = data })
+            upload(peer, { name = game.name, zip = data }, coroutine.yield)
             print('served game for ' .. ip .. ':' .. port)
         else
             error('received unknown "what"')

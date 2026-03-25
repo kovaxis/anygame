@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from pathlib import Path
+import random
 import re
 import subprocess
 import socket
@@ -19,47 +20,200 @@ msglimit = 1024 * 1024 * 1024
 
 options = {}
 
-options["screenlogs"] = r"""
-local ogprint = _G.print
-local ogpresent = love.graphics.present
+# this is keepconnection line 0
+keepconnection = r"""
+local anygame = ...
 
-local fonth = nil
-local font = nil
-local logs = {}
+_G._anygame = anygame
 
-_G.print = function(...)
-    ogprint(...)
-    logs[#logs+1] = table.concat({...}, ' ', 1, select('#', ...))
+if anygame.ip and anygame.port then
+    local send = love.thread.newChannel()
+    local recv = love.thread.newChannel()
+
+    local thread = love.thread.newThread(love.filesystem.newFileData([[ -- this is thread line 0
+        require 'love.timer'
+        require 'love.data'
+        local socket = require 'socket'
+        local args = ...
+        local sock
+        if args.socketfd then
+            sock = socket.tcp()
+            sock:close()
+            sock:setfd(args.socketfd)
+        end
+
+        local function check(ok, warn)
+            if not ok then
+                print(debug.traceback('check failed: '..tostring(warn), 2))
+            end
+        end
+
+        local function serialize(keyval, hello)
+            local t = { '' }
+            if hello then
+                keyval.version = args.version
+                t[1] = args.magic
+                t[2] = ''
+            end
+            local n = 0
+            for k, v in pairs(keyval) do
+                n = n + 4 + #k + 4 + #v
+                assert(n <= 2^30, 'too large')
+                local s = love.data.pack('string', '<s4s4', k, v)
+                t[#t + 1] = s
+            end
+            t[hello and 2 or 1] = love.data.pack('string', '<I4', n)
+            return table.concat(t)
+        end
+
+        local function unserialize(s, i)
+            i = i or 1
+            local out = {}
+            while i <= #s do
+                local k, v
+                k, v, i = love.data.unpack('<s4s4', s, i)
+                out[k] = v
+            end
+            return out
+        end
+
+        local function downloadn(sock, n, wait)
+            local buf = ''
+            while #buf < n do
+                local all, err, piece = sock:receive(n - #buf)
+                if all then
+                    buf = buf .. all
+                    return buf
+                elseif err == 'timeout' then
+                    buf = buf .. piece
+                    if wait then wait() end
+                else
+                    error(err, 2)
+                end
+            end
+        end
+
+        local function download(sock, wait, hello)
+            local m = hello and args.magic or ''
+            local prefix = downloadn(sock, #m + 4, wait)
+            assert(prefix:sub(1, #m) == m, 'invalid magic')
+            local len = love.data.unpack('<I4', prefix:sub(#m + 1))
+            assert(len <= 2^30, 'too large')
+            local payload = downloadn(sock, len, wait)
+            local data = unserialize(payload)
+            if hello then assert(data.version, 'no version') end
+            return data
+        end
+
+        local function upload(sock, data, wait, hello)
+            packet = serialize(data, hello)
+            local i = 1
+            while true do
+                local ok, err, sent = sock:send(packet, i)
+                if ok then
+                    return
+                elseif err == 'timeout' then
+                    i = sent + 1
+                    if wait then wait() end
+                else
+                    error(err, 2)
+                end
+            end
+        end
+
+        local function downloadloop()
+            while true do
+                local msg = download(sock, coroutine.yield)
+                args.recv:push(msg)
+                coroutine.yield()
+            end
+        end
+
+        local function uploadloop()
+            while true do
+                local msg = args.send:demand(0.100)
+                if msg == 'quit' then
+                    return true
+                elseif msg then
+                    upload(sock, msg, coroutine.yield)
+                end
+                coroutine.yield()
+            end
+        end
+
+        local function cycle()
+            if not sock then
+                assert(args.ip and args.port, 'no ip/port?')
+                print('reopening anygame connection to ' .. args.ip .. ':' .. args.port)
+                sock = socket.tcp()
+                check(sock:settimeout(5))
+                assert(sock:connect(args.ip, args.port))
+                upload(sock, { what = 'stream' }, nil, true)
+                local hello = download(sock, nil, true)
+                assert(hello.what == 'stream', 'invalid "what", expected "stream"')
+            end
+
+            sock:settimeout(0.100)
+            local uploadco = coroutine.wrap(uploadloop)
+            local downloadco = coroutine.wrap(downloadloop)
+            while true do
+                local sdeadline = love.timer.getTime() + 0.090
+                while love.timer.getTime() <= sdeadline do
+                    if uploadco() then break end
+                end
+                local rdeadline = love.timer.getTime() + 0.090
+                while love.timer.getTime() <= rdeadline do
+                    downloadco()
+                end
+            end
+        end
+
+        while true do
+            local ok, err = pcall(cycle)
+            if sock then sock:close() end
+            sock = nil
+            if ok then break end
+            print('anygame network thread error: '..tostring(err))
+            love.timer.sleep(5)
+        end
+        print('exiting anygame network thread')
+    ]], 'anygame-network-thread'))
+
+    local socketfd
+    if anygame.socket then
+        print('socket is ', anygame.socket)
+        socketfd = anygame.socket:getfd()
+        anygame.socket:setfd(-1)
+        anygame.socket:close()
+        anygame.socket = nil
+    end
+
+    thread:start {
+        magic = anygame.magic,
+        version = anygame.version,
+        send = send,
+        recv = recv,
+        ip = anygame.ip,
+        port = anygame.port,
+        socketfd = socketfd,
+    }
+
+    anygame.send = send
+    anygame.receive = recv
+    anygame.networkthread = thread
+else
+    print('no ip/port, cannot connect back to anygame server')
 end
+"""
 
-love.graphics.present = function()
-    local ogfont = love.graphics.getFont()
-    local r, g, b, a = love.graphics.getColor()
-    love.graphics.push()
-
-    local w, h = love.graphics.getDimensions()
-    local wanth = math.floor(h * 0.01)
-    if wanth ~= fonth then
-        fonth = wanth
-        font = love.graphics.newFont(fonth)
+options["logs"] = r"""
+do
+    local ogprint = _G.print
+    _G.print = function(...)
+        ogprint(...)
+        local log = table.concat({...}, ' ', 1, select('#', ...))
+        anygame.send:push({ what = 'log', log = log })
     end
-
-    love.graphics.setFont(font)
-    love.graphics.setColor(0, 0, 0)
-
-    love.graphics.origin()
-    local margin = h * 0.01
-    local y = h - margin
-    for i = #logs, 1, -1 do
-        y = y - fonth
-        if y <= -fonth then break end
-        love.graphics.print(logs[i], margin, y)
-    end
-
-    love.graphics.pop()
-    love.graphics.setColor(r, g, b, a)
-    love.graphics.setFont(ogfont)
-    return ogpresent()
 end
 """
 
@@ -181,6 +335,8 @@ for option in args[1:]:
         print(f"unknown option {option}")
         sys.exit(1)
     preload += options[key]
+if preload:
+    preload = keepconnection + preload
 
 gamedir = args[0]
 if not Path(gamedir).exists():
@@ -203,9 +359,12 @@ def packgame():
     return gamedata
 
 
-def serialize(data):
-    data["version"] = version
-    out = bytearray(magic)
+def serialize(data, stream=False):
+    m = b""
+    if not stream:
+        data["version"] = version
+        m = magic
+    out = bytearray(m)
     out.extend(b"----")
     for key, value in data.items():
         k = key
@@ -218,11 +377,11 @@ def serialize(data):
         out.extend(k)
         out.extend(struct.pack("<I", len(v)))
         out.extend(v)
-    out[len(magic) : len(magic) + 4] = struct.pack("<I", len(out) - len(magic) - 4)
+    out[len(m) : len(m) + 4] = struct.pack("<I", len(out) - len(m) - 4)
     return bytes(out)
 
 
-def unserialize(data):
+def unserialize(data, stream=False):
     out = {}
     offset = 0
 
@@ -244,7 +403,8 @@ def unserialize(data):
         out[k] = v
 
     out = defaultdict(lambda: None, out)
-    check(out["version"], "no version data")
+    if not stream:
+        check(out["version"], "no version data")
     return out
 
 
@@ -253,18 +413,22 @@ def downloadn(sock, n):
     while len(buf) < n:
         piece = sock.recv(n - len(buf))
         if len(piece) == 0:
-            raise ConnectionError("unexpected eof")
+            if len(buf) > 0:
+                raise ConnectionError("unexpected eof")
+            else:
+                raise EOFError()
         buf += piece
     return buf
 
 
-def download(sock):
-    prefix = downloadn(sock, len(magic) + 4)
-    check(prefix[: len(magic)] == magic, "invalid magic")
-    (length,) = struct.unpack("<I", prefix[len(magic) :])
+def download(sock, stream=False):
+    m = b"" if stream else magic
+    prefix = downloadn(sock, len(m) + 4)
+    check(prefix[: len(m)] == m, "invalid magic")
+    (length,) = struct.unpack("<I", prefix[len(m) :])
     check(length <= msglimit, "too large")
     packet = downloadn(sock, length)
-    return unserialize(packet)
+    return unserialize(packet, stream)
 
 
 def parse(packet):
@@ -324,12 +488,33 @@ def serve(peer, addr):
                     {
                         "name": gamename,
                         "zip": packgame(),
-                        **({"preload": preload} if preload else {}),
+                        **({"preload": preload, "keep": "true"} if preload else {}),
                     }
                 )
             )
+        elif req["what"] == "stream":
+            print("serving stream to ", addr)
+            peer.sendall(serialize({"what": "stream"}))
         else:
             check(False, f'unknown "what": {req["what"]}')
+
+        colors = [31, 32, 33, 34, 35, 36, 37, 91, 92, 93, 94, 95, 96, 97]
+        c = colors[random.randint(0, len(colors) - 1)]
+        prefix = str(addr[0]) + ":" + str(addr[1])
+        prefix = f"\033[1;{c}m[{prefix}]\033[0m "
+
+        while True:
+            try:
+                msg = download(peer, True)
+            except EOFError:
+                break
+            if msg["what"] == "log":
+                check(msg["log"], 'expected "log" field')
+                for line in msg["log"].splitlines():
+                    print(f"{prefix}{line}")
+            else:
+                print(f'unknown "what": {req["what"]}')
+        print(f"closing connection to {addr}")
     except Exception:
         traceback.print_exc()
     finally:
