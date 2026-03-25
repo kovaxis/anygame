@@ -2,9 +2,11 @@
 
 from collections import defaultdict
 from io import BytesIO
+import os
 from pathlib import Path
 import random
 import re
+import signal
 import zipfile
 import socket
 from threading import Thread
@@ -231,6 +233,14 @@ else
 end
 """
 
+
+def on_interrupt(sig, frame):
+    print()
+    os._exit(0)
+
+
+signal.signal(signal.SIGINT, on_interrupt)
+
 options = {"logs", "files"}
 
 args = sys.argv[1:]
@@ -405,7 +415,7 @@ def announce():
                 packet, fromaddr = sock.recvfrom(4096)
             except OSError:
                 traceback.print_exc()
-                time.sleep(5)
+                time.sleep(1)
                 continue
             try:
                 msg = parse(packet)
