@@ -36,11 +36,6 @@ if anygame.ip and anygame.port then
         local socket = require 'socket'
         local args = ...
         local sock
-        if args.socketfd then
-            sock = socket.tcp()
-            sock:close()
-            sock:setfd(args.socketfd)
-        end
 
         local function check(ok, warn)
             if not ok then
@@ -179,15 +174,6 @@ if anygame.ip and anygame.port then
         print('exiting anygame network thread')
     ]], 'anygame-network-thread'))
 
-    local socketfd
-    if anygame.socket then
-        print('socket is ', anygame.socket)
-        socketfd = anygame.socket:getfd()
-        anygame.socket:setfd(-1)
-        anygame.socket:close()
-        anygame.socket = nil
-    end
-
     thread:start {
         magic = anygame.magic,
         version = anygame.version,
@@ -195,7 +181,6 @@ if anygame.ip and anygame.port then
         recv = recv,
         ip = anygame.ip,
         port = anygame.port,
-        socketfd = socketfd,
     }
 
     anygame.send = send
@@ -488,7 +473,7 @@ def serve(peer, addr):
                     {
                         "name": gamename,
                         "zip": packgame(),
-                        **({"preload": preload, "keep": "true"} if preload else {}),
+                        **({"preload": preload} if preload else {}),
                     }
                 )
             )
