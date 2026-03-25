@@ -430,7 +430,11 @@ def serve(peer, addr):
     try:
         print("serving connection from", addr)
         peer.settimeout(5)
-        req = download(peer)
+        try:
+            req = download(peer)
+        except EOFError:
+            print(f"empty connection from {addr}")
+            return
         if str(addr) not in clientlist:
             clientlist.append(addr[0] + ":" + str(addr[1]))
         if req["what"] == "head":
