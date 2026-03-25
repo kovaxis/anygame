@@ -37,6 +37,8 @@ if anygame.ip and anygame.port then
         local args = ...
         local sock
 
+        local cooldown = 1
+
         local function check(ok, warn)
             if not ok then
                 print(debug.traceback('check failed: '..tostring(warn), 2))
@@ -146,6 +148,7 @@ if anygame.ip and anygame.port then
                 upload(sock, { what = 'stream' }, nil, true)
                 local hello = download(sock, nil, true)
                 assert(hello.what == 'stream', 'invalid "what", expected "stream"')
+                cooldown = 1
             end
 
             sock:settimeout(0.100)
@@ -169,7 +172,8 @@ if anygame.ip and anygame.port then
             sock = nil
             if ok then break end
             print('anygame network thread error: '..tostring(err))
-            love.timer.sleep(5)
+            love.timer.sleep(cooldown)
+            cooldown = math.min(cooldown + 1, 7)
         end
         print('exiting anygame network thread')
     ]], 'anygame-network-thread'))
